@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <cctype>
+#include <fstream>          // added
+#include <set>              // added
 #include <yaml-cpp/yaml.h>
 #include <nlohmann/json.hpp>
 
@@ -64,6 +66,120 @@ static fs::path self_dir() {
     if (n <= 0) return fs::current_path();
     buf[n] = '\0';
     return fs::path(buf).parent_path();
+}
+
+// trim helpers
+static std::string trim_copy(std::string s) {
+    auto not_space = [](unsigned char c){ return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+// load file to string (whole file), trimmed
+static bool read_file_trimmed(const fs::path& p, std::string& out) {
+    std::ifstream f(p);
+    if (!f.good()) return false;
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    out = trim_copy(s);
+    return !out.empty();
+}
+
+// set default env var if missing/empty
+static void set_default_env(const char* key, const char* value) {
+    const char* cur = std::getenv(key);
+    if (!cur || !*cur) setenv(key, value, 1);
+}
+
+// --- NEW: load runtime environment from config/runtime.env if present ---
+// Only whitelisted keys are read here (security & predictability).
+static void load_runtime_env_from_config() {
+    // locate config/runtime.env near the binary first, then in source tree
+    fs::path bin_cfg = self_dir().parent_path() / "config" / "runtime.env";
+    fs::path src_cfg = fs::path(PROJECT_SOURCE_DIR) / "config" / "runtime.env";
+    fs::path cwd_cfg = fs::current_path() / "config" / "runtime.env";
+
+    fs::path cfg;
+    if (fs::exists(bin_cfg)) cfg = bin_cfg;
+    else if (fs::exists(src_cfg)) cfg = src_cfg;
+    else if (fs::exists(cwd_cfg)) cfg = cwd_cfg;
+
+    if (cfg.empty()) return;
+
+    // whitelist of keys we allow from the project config file
+    const std::set<std::string> allowed = {
+        "OPENAI_REALTIME_MODEL",
+        "AUTO_RESPOND",
+        "WAKEWORD_REQUIRED",
+        "ASR_LANG",
+        "VAD_THRESHOLD_RMS",
+        "PRINT_TRANSCRIPT",
+        "WAKEWORD"
+        // NOTE: OPENAI_API_KEY is intentionally NOT allowed here
+    };
+
+    std::ifstream in(cfg);
+    if (!in.good()) return;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        // strip comments (# or ;)
+        auto hash = line.find('#'); if (hash != std::string::npos) line.erase(hash);
+        auto semi = line.find(';'); if (semi != std::string::npos) line.erase(semi);
+        line = trim_copy(line);
+        if (line.empty()) continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim_copy(line.substr(0, eq));
+        std::string val = trim_copy(line.substr(eq + 1));
+
+        // remove optional surrounding quotes
+        if (!val.empty() && ((val.front()=='"' && val.back()=='"') || (val.front()=='\'' && val.back()=='\''))) {
+            val = val.substr(1, val.size()-2);
+        }
+
+        if (allowed.count(key) == 0) continue;        // skip non-whitelisted keys
+        if (key == "OPENAI_API_KEY") continue;        // belt & suspenders
+
+        // only set if not already set in real environment
+        const char* cur = std::getenv(key.c_str());
+        if (!cur || !*cur) setenv(key.c_str(), val.c_str(), 1);
+    }
+
+    std::cout << "Loaded runtime env from " << cfg.string() << "\n";
+}
+
+// Bootstrap environment so users don’t need to export anything manually.
+// - loads OPENAI_API_KEY from $XDG_CONFIG_HOME/openai/api_key or ~/.config/openai/api_key if unset
+// - loads additional runtime env from config/runtime.env (whitelisted keys only)
+// - sets safe defaults for all runtime knobs if still unset
+static void bootstrap_env_defaults() {
+    // 1) read project config first (if present)
+    load_runtime_env_from_config();
+
+    // 2) defaults requested, only if still unset
+    set_default_env("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview");
+    set_default_env("AUTO_RESPOND", "0");
+    set_default_env("WAKEWORD_REQUIRED", "0");
+    set_default_env("ASR_LANG", "auto");
+    set_default_env("VAD_THRESHOLD_RMS", "900");
+    set_default_env("PRINT_TRANSCRIPT", "1");
+
+    // 3) API key from user config if needed (never from project config)
+    const char* api_env = std::getenv("OPENAI_API_KEY");
+    if (!api_env || !*api_env) {
+        fs::path cfgHome = std::getenv("XDG_CONFIG_HOME")
+                           ? fs::path(std::getenv("XDG_CONFIG_HOME"))
+                           : (fs::path(std::getenv("HOME")) / ".config");
+        fs::path keyPath = cfgHome / "openai" / "api_key";
+        std::string key;
+        if (read_file_trimmed(keyPath, key)) {
+            setenv("OPENAI_API_KEY", key.c_str(), 1);
+            std::cout << "Loaded OPENAI_API_KEY from " << keyPath.string() << "\n";
+        }
+    }
 }
 
 static void run_motion_by_phrase(const std::string& phrase) {
@@ -344,7 +460,6 @@ static void onUtteranceCommit(const std::string& full_text) {
     }
 }
 
-
 // Optional: show user-only transcript deltas
 static void onTranscriptDelta(const std::string& s) {
     if (print_transcript) std::cout << "📝 [Transcript] " << s << std::endl;
@@ -357,6 +472,9 @@ int main(int argc, char **argv) {
     if (g_brand_fingerprint) std::cout << "Fingerprint: " << g_brand_fingerprint << "\n";
     if (argc < 2) { std::cout << "Usage: voice_interface [NetWorkInterface(eth0)]\n"; return 0; }
     setenv("ROBOT_IFACE", argv[1], 1);
+
+    // <<< ensure defaults & load API key from user config; also load config/runtime.env
+    bootstrap_env_defaults();
 
     wake_required = (std::getenv("WAKEWORD_REQUIRED") && std::string(std::getenv("WAKEWORD_REQUIRED"))=="1");
     print_transcript = (std::getenv("PRINT_TRANSCRIPT") && std::string(std::getenv("PRINT_TRANSCRIPT"))=="1");

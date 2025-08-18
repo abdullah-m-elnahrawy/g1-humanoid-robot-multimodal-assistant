@@ -2,8 +2,8 @@
 # Build & Run: Voice-Based Motions
 # - Non-interactive, one-liner friendly
 # - Reuses build/ unless --clean is passed
-# - Loads OPENAI_API_KEY from ~/.config/openai/api_key if not set
-# - Exports OPENAI_REALTIME_MODEL, ROBOT_IFACE, and optional audio gate vars
+# - Loads OPENAI_API_KEY from $XDG_CONFIG_HOME/openai/api_key or ~/.config/openai/api_key if not set
+# - Exports OPENAI_REALTIME_MODEL, ROBOT_IFACE, and audio gate vars
 # - Ensures motion runner binary name compatibility via symlink
 
 set -euo pipefail
@@ -17,10 +17,11 @@ DEFAULT_MCAST_IP="239.168.123.161"
 DEFAULT_MCAST_PORT="5555"
 
 # Simple gate knobs (for your AudioProcessingPipeline fallback)
-DEFAULT_VAD_THRESHOLD="800"
+DEFAULT_VAD_THRESHOLD="900"
 DEFAULT_VAD_START_FRAMES="3"
 
-API_KEY_FILE="${HOME}/.config/openai/api_key"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+API_KEY_FILE="${CONFIG_HOME}/openai/api_key"
 
 # ---------- Args ----------
 CLEAN=0
@@ -43,23 +44,32 @@ export OPENAI_REALTIME_MODEL="${OPENAI_REALTIME_MODEL:-$DEFAULT_MODEL}"
 
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   if [[ -r "${API_KEY_FILE}" ]]; then
-    export OPENAI_API_KEY="$(cat "${API_KEY_FILE}")"
+    export OPENAI_API_KEY="$(tr -d '\r' < "${API_KEY_FILE}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     echo "Loaded OPENAI_API_KEY from ${API_KEY_FILE}"
   else
     echo "ERROR: OPENAI_API_KEY not set and ${API_KEY_FILE} not found."
-    echo "Export OPENAI_API_KEY or create ${API_KEY_FILE}."
+    echo "Create the file with your key, e.g.:"
+    echo "  mkdir -p \"${CONFIG_HOME}/openai\" && echo 'sk-...' > \"${API_KEY_FILE}\""
     exit 1
   fi
 fi
 
-# ---------- Runtime env (read by your app where applicable) ----------
+# ---------- Runtime env (read by the app; app also sets defaults if you forget) ----------
 export ROBOT_IFACE="${INTERFACE_NAME}"
 export ROBOT_MCAST_IP="${MCAST_IP}"
 export ROBOT_MCAST_PORT="${MCAST_PORT}"
+
+# Conversation/ASR defaults
+export AUTO_RESPOND="${AUTO_RESPOND:-0}"
+export WAKEWORD_REQUIRED="${WAKEWORD_REQUIRED:-0}"
+export ASR_LANG="${ASR_LANG:-auto}"
+export PRINT_TRANSCRIPT="${PRINT_TRANSCRIPT:-1}"
+
+# Audio gate defaults
 export VAD_THRESHOLD_RMS="${VAD_THRESHOLD_RMS:-$DEFAULT_VAD_THRESHOLD}"
 export VAD_MIN_VOICE_FRMS="${VAD_MIN_VOICE_FRMS:-$DEFAULT_VAD_START_FRAMES}"
 
-# Optional wake-word gate (set WAKEWORD_REQUIRED=1 to enforce)
+# Optional wake-word name (unused when WAKEWORD_REQUIRED=0)
 export WAKEWORD="${WAKEWORD:-hasan}"
 
 # ---------- Build ----------
@@ -128,9 +138,12 @@ echo " OPENAI_REALTIME_MODEL = ${OPENAI_REALTIME_MODEL}"
 echo " ROBOT_IFACE           = ${ROBOT_IFACE}"
 echo " ROBOT_MCAST_IP        = ${ROBOT_MCAST_IP}   (note: current code uses #defines)"
 echo " ROBOT_MCAST_PORT      = ${ROBOT_MCAST_PORT} (note: current code uses #defines)"
+echo " AUTO_RESPOND          = ${AUTO_RESPOND}"
+echo " WAKEWORD_REQUIRED     = ${WAKEWORD_REQUIRED}"
+echo " ASR_LANG              = ${ASR_LANG}"
+echo " PRINT_TRANSCRIPT      = ${PRINT_TRANSCRIPT}"
 echo " VAD_THRESHOLD_RMS     = ${VAD_THRESHOLD_RMS}"
 echo " VAD_MIN_VOICE_FRMS    = ${VAD_MIN_VOICE_FRMS}"
-echo " WAKEWORD_REQUIRED     = ${WAKEWORD_REQUIRED:-0}"
 echo " WAKEWORD              = ${WAKEWORD}"
 echo "----------------------------------------------"
 echo "Running voice interface…"
