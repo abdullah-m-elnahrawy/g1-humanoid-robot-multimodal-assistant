@@ -1,0 +1,42 @@
+motions:
+- file: shake_hands.seq
+  triggers:
+  - hello hasan, shake hands
+  - hi hasan, shake hands
+  - hasan, let's shake hands
+  - يا حسن صافحني
+  - يا حسن سلم علي
+  - يا حسن سلم عليا
+  - حسن صافحني
+  - صافحني يا حسن
+  threshold: 0.8
+
+- file: military_salute.seq
+  triggers:
+  - hello hasan, this is abdullah. please perform the military salute
+  - hasan, perform military salute
+  - hasan, give me a military salute
+  - يا حسن حيي تحية عسكرية
+  - يا حسن اعمل تحية عسكرية
+  - حسن حيي تحية عسكرية
+  - حيي تحية عسكرية يا حسن
+  threshold: 0.7
+
+- file: welcome_visitors.seq
+  triggers:
+  - hello hasan, welcome our visitors
+  - hi hasan, welcome visitors
+  - يا حسن رحب بالزوار
+  - يا حسن رحب بضيوفنا
+  - حسن رحب بالضيوف
+  - رحب بالزوار يا حسن
+  - يا حسن قل اهلا وسهلا للزوار
+  threshold: 0.7
+
+
+
+
+
+
+
+

@@ -1,0 +1,14 @@
+components:
+  - name: g1
+    type: arm
+  - name: salute
+    type: keyframes
+    frames:
+      - [
+           0.3, 0.6, -1.0, 1.5, -0.2, -0.0, -0.0,   # Left arm
+          -0.5, -1.5, -0.7, -0.9, 1.0, 0.0, 0.0 # Right arm (saluting pose)
+        ]
+
+
+
+

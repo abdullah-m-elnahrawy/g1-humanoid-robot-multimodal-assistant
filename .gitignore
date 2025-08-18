@@ -1,0 +1,26 @@
+# Build / cache
+build/
+dist/
+*.o
+*.obj
+*.log
+.DS_Store
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# VS Code
+.vscode/
+
+# Secrets
+*.pem
+*.key
+*.pfx

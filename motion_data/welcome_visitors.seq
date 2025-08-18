@@ -1,0 +1,18 @@
+components:
+  - name: g1
+    type: arm
+  - name: handshake
+    type: keyframes
+    frames:
+      - [
+          -0.0, -0.0, 0.3, 0.0, -1.04, -0.0, -0.0,   # Left arm joints angles in radian
+          -0.0, 0.0, -0.3, 0.0, 1.04, 0.0, 0.0  # Right arm joints angle in radian 
+        ]
+        
+#when looking at the robot from outside:
+#To move motor at each joint:
+#clockwise = angle positive 
+#ant-clockwise angle negative
+
+        
+

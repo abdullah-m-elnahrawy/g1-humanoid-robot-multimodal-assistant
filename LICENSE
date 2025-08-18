@@ -1,0 +1,74 @@
+Non-Commercial, No-Patent License (NCNP) v1.0
+Copyright (c) 2025 Abdullah El-Nahrawy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to use, copy,
+and modify the Software solely for non-commercial research, personal, or
+educational purposes, subject to the following conditions:
+
+1) Non-Commercial Only.  Commercial use is prohibited. “Commercial use” means
+any use intended for or directed toward commercial advantage or monetary
+compensation, including use by or for the benefit of a for-profit entity.
+
+2) Redistribution.  You may redistribute the Software and your modifications
+for non-commercial purposes only, provided you include this license in full and
+clearly mark any changes you made. You may not sublicense.
+
+3) No Patent License; No Patenting.  No patent rights are granted or implied.
+You may not practice any patent claims owned or controlled by the Licensor, and
+you may not apply for, assist in, or assert any patent claim that reads on the
+Software or any derivative work. Any breach of this clause terminates your
+rights under this license immediately.
+
+4) No Trademark License.  This license does not grant rights to use the names,
+logos, or trademarks of the Licensor.
+
+5) Termination.  Any breach of this license automatically terminates the
+permissions granted herein. Upon termination you must cease all use of the
+Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+
+For commercial licensing, contact: your.email@example.com
+cat > LICENSE << 'EOF'
+Non-Commercial, No-Patent License (NCNP) v1.0
+Copyright (c) 2025 Abdullah El-Nahrawy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to use, copy,
+and modify the Software solely for non-commercial research, personal, or
+educational purposes, subject to the following conditions:
+
+1) Non-Commercial Only.  Commercial use is prohibited. “Commercial use” means
+any use intended for or directed toward commercial advantage or monetary
+compensation, including use by or for the benefit of a for-profit entity.
+
+2) Redistribution.  You may redistribute the Software and your modifications
+for non-commercial purposes only, provided you include this license in full and
+clearly mark any changes you made. You may not sublicense.
+
+3) No Patent License; No Patenting.  No patent rights are granted or implied.
+You may not practice any patent claims owned or controlled by the Licensor, and
+you may not apply for, assist in, or assert any patent claim that reads on the
+Software or any derivative work. Any breach of this clause terminates your
+rights under this license immediately.
+
+4) No Trademark License.  This license does not grant rights to use the names,
+logos, or trademarks of the Licensor.
+
+5) Termination.  Any breach of this license automatically terminates the
+permissions granted herein. Upon termination you must cease all use of the
+Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+
+For commercial licensing, contact: abdullah.m.elnahrawy@outlook.com
+
