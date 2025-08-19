@@ -381,18 +381,30 @@ std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
 
   if (!loadMotionRegistry(registryPath)) return 1;
 
-  // If --say provided, fuzzy-pick a file from registry triggers
-  if (!sayPhrase.empty()) {
+  // If --say provided, choose best motion BUT REQUIRE its own threshold
+  bool hadSay = !sayPhrase.empty();
+  if (hadSay) {
     std::string in = toLowerAndTrim(sayPhrase);
-    std::string best; double bestScore = -1.0;
+    std::string bestFile;
+    double bestScore = -1.0;
+    double bestRequired = 1.0;
+
     for (auto &m : motionRegistry) {
+      double motionBest = -1.0;
       for (auto &t : m.triggers) {
         int dist = levenshteinDistance(in, toLowerAndTrim(t));
         double sim = 1.0 - (double)dist / std::max(in.size(), t.size());
-        if (sim > bestScore) { bestScore = sim; best = m.file_name; }
+        if (sim > motionBest) motionBest = sim;
+      }
+      if (motionBest >= m.fuzzy_threshold && motionBest > bestScore) {
+        bestScore = motionBest;
+        bestFile  = m.file_name;
+        bestRequired = m.fuzzy_threshold;
       }
     }
-    if (!best.empty()) playFile = best;
+    if (!bestFile.empty()) {
+      playFile = bestFile;
+    }
   }
 
   G1Example robot(interface);
@@ -410,6 +422,12 @@ std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
     while (robot.IsRunning()) { usleep(10000); }
 
     return 0;
+  }
+
+  // If we were invoked with --say but nothing met its threshold, exit with a non-zero code.
+  if (hadSay && playFile.empty()) {
+    std::cerr << "No motion matched \"" << sayPhrase << "\" above its threshold.\n";
+    return 2;
   }
 
   // --- Interactive menu (legacy) ---

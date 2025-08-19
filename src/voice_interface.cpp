@@ -182,13 +182,15 @@ static void bootstrap_env_defaults() {
     }
 }
 
-static void run_motion_by_phrase(const std::string& phrase) {
+// Return code from motion runner
+static int run_motion_by_phrase(const std::string& phrase) {
     std::string iface = std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0";
     fs::path motion_bin = self_dir() / "abdullah_elnahrawy_g1_motions";
     std::cout << "Executing motion via phrase: " << phrase << std::endl;
     std::string cmd = "\"" + motion_bin.string() + "\" " + iface + " --say \"" + phrase + "\"";
     int ret = std::system(cmd.c_str());
     if (ret != 0) std::cerr << "[WARN] runner exited with code " << ret << std::endl;
+    return ret;
 }
 
 static std::string lowercase(std::string s) {
@@ -417,7 +419,7 @@ static void thread_mic() {
     close(sock); sock = -1;
 }
 
-// ---------- utterance handler (no wakeword) ----------
+// ---------- utterance handler ----------
 static void onUtteranceCommit(const std::string& full_text) {
     if (full_text.empty()) return;
 
@@ -439,22 +441,30 @@ static void onUtteranceCommit(const std::string& full_text) {
 
     if (print_transcript) std::cout << "📝 [Utterance] " << trimmed << std::endl;
 
-    // Route to motion or chat
+    // 1) Local deterministic fast path
     MotionIntent intent = detect_motion_intent(trimmed);
     if (intent.is_motion) {
-        std::cout << "[Router] Motion intent → " << intent.english_cmd << std::endl;
-        std::string phrase = "hasan, " + intent.english_cmd;
-        run_motion_by_phrase(phrase);
-        return;
+        int rc = run_motion_by_phrase(std::string("hasan, ") + intent.english_cmd);
+        if (rc == 0) return;  // motion executed
+        // if runner refused (no threshold match), continue to fallback/model path
     }
 
-    // Speak back (low-latency streaming comes from realtime_openai.hpp)
+    // 2) Data-driven fallback (YAML fuzzy): try the whole utterance
+    {
+        int rc = run_motion_by_phrase(trimmed);
+        if (rc == 0) return;  // matched a YAML trigger above threshold and executed
+    }
+
+    // 3) Ask the model to decide and either call the tool run_motion or speak briefly
     bool ar = looks_arabic(trimmed);
     std::string instr = ar
-        ? std::string("أجب بإيجاز شديد (جملة أو جملتين) وبالعربية الفصحى. بدون مقدمات. نص المستخدم: ") + trimmed
-        : std::string("Answer briefly (1–2 sentences) in English. No preambles. User said: ") + trimmed;
+        ? std::string("أجب بإيجاز شديد (جملة أو جملتين) وبالعربية الفصحى. "
+                      "إذا كان المستخدم يطلب حركة جسدية واضحة، فاستدع أداة run_motion مع خاصية phrase بوصف إنجليزي قصير للحركة. "
+                      "وإلا تحدث بإجابة قصيرة. نص المستخدم: ") + trimmed
+        : std::string("Answer briefly (1–2 sentences). "
+                      "If the user is asking the robot to perform a physical motion, call the tool `run_motion` with a short English `phrase` describing it. "
+                      "Otherwise just speak a short answer. User said: ") + trimmed;
 
-    // Guard: don’t stack responses
     if (rt && !rt->responseInFlight()) {
         rt->createSpeakResponse(instr, "alloy");
     }
@@ -511,6 +521,26 @@ int main(int argc, char **argv) {
 
         std::cout << "[Init] Connecting to voice server (OpenAI protocol)...\n";
         rt = std::make_unique<RealtimeOpenAI>(apiKey, onAssistantAudio, onTranscriptDelta, onUtteranceCommit);
+
+        // Session-level instructions enable tool-calling for motions
+        rt->setInstructions(
+            "You control a humanoid robot named Hasan.\n"
+            "- If the user issues an imperative/request to perform a PHYSICAL MOTION (e.g., handshake, military salute, wave, bow, sit, stand, welcome visitors), call the tool `run_motion` with a short English `phrase` describing the motion.\n"
+            "- Otherwise, speak a brief answer (1–2 sentences).\n"
+            "Keep latency low and avoid long preambles."
+        );
+
+        // If model calls our tool, execute locally via the motion runner (YAML thresholds enforced there)
+        rt->setToolCallback([](const std::string& name, const json& args){
+            if (name == "run_motion") {
+                std::string phrase = args.value("phrase", "");
+                if (!phrase.empty()) {
+                    // prefix the robot name (helps deterministic stripping in the runner triggers, if any)
+                    (void)run_motion_by_phrase(std::string("hasan, ") + phrase);
+                }
+            }
+        });
+
         rt->setResponseGate([](){ return true; });
         if (!rt->start()) { std::cerr << "[Error] Failed to start Realtime session.\n"; return 1; }
         std::cout << "[Init] ✅ Realtime session established\n";
@@ -522,7 +552,7 @@ int main(int argc, char **argv) {
         std::cout << "🎤 Audio capture: ACTIVE (client HPF+gate+AEC → server VAD)\n";
         std::cout << "📝 Utterance routing: ACTIVE (Arabic/English, no wakeword)\n";
         std::cout << "📡 OpenAI streaming: ACTIVE (buffered TTS playback)\n";
-        std::cout << "🤖 Motion routing: ACTIVE (via runner --say)\n";
+        std::cout << "🤖 Motion routing: ACTIVE (deterministic → YAML fuzzy → model tool)\n";
         std::cout << "Wake word required: " << (wake_required ? "YES" : "NO") << "\n";
         std::cout << "Press Ctrl-C to quit\n\n";
 

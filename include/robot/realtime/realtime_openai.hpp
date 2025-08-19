@@ -22,6 +22,7 @@ public:
     using AudioCallback      = std::function<void(const std::vector<int16_t>&)>; // 24k PCM, may be small streaming chunks
     using TranscriptCallback = std::function<void(const std::string&)>;          // user transcript deltas (optional)
     using UtteranceCallback  = std::function<void(const std::string&)>;          // final user utterance (once per VAD)
+    using ToolCallback       = std::function<void(const std::string& /*name*/, const nlohmann::json& /*args*/)>;
 
     RealtimeOpenAI(const std::string& api_key,
                    const AudioCallback& onAudio,
@@ -36,6 +37,7 @@ public:
 
     void setInstructions(const std::string& s) { instructions_ = s; }
     void setResponseGate(std::function<bool()> fn) { responseGate_ = std::move(fn); }
+    void setToolCallback(const ToolCallback& cb) { tool_cb_ = cb; }
 
     bool start() {
         try {
@@ -139,8 +141,27 @@ private:
         if (asr == "en" || asr == "zh" || asr == "ar") transcribe["language"] = asr;
 
         std::string instr = instructions_.empty()
-          ? "Transcribe only. Do not autonomously answer; only speak when I send response.create."
+          ? "You control a humanoid robot named Hasan.\n"
+            "- If the user issues an imperative or request to perform a PHYSICAL GESTURE/MOTION (e.g., handshake, military salute, wave, bow, sit, stand, welcome visitors, etc.), call the tool `run_motion` with a short English `phrase` describing the motion (e.g., \"shake hands\", \"perform military salute\").\n"
+            "- Otherwise, answer briefly and clearly (1–2 sentences) and speak.\n"
+            "Do not require a wake word unless the user uses it."
           : instructions_;
+
+        // Expose a single function-style tool the model can call
+        nlohmann::json tools = nlohmann::json::array({
+            {
+                {"type","function"},
+                {"name","run_motion"},
+                {"description","Trigger a predefined robot motion by phrase (the robot will choose the best matching sequence from its registry)."},
+                {"parameters", {
+                    {"type","object"},
+                    {"properties", {
+                        {"phrase", {{"type","string"}, {"description","Concise English instruction for the motion, e.g., 'shake hands', 'perform military salute', 'welcome visitors'."}}}
+                    }},
+                    {"required", {"phrase"}}
+                }}
+            }
+        });
 
         nlohmann::json cfg = {
             {"type", "session.update"},
@@ -150,7 +171,8 @@ private:
                 {"output_audio_format", "pcm16"},
                 {"turn_detection", {{"type", "server_vad"}}},
                 {"input_audio_transcription", transcribe},
-                {"instructions", instr}
+                {"instructions", instr},
+                {"tools", tools}
             }}
         };
         client_.send(conn_, cfg.dump(), websocketpp::frame::opcode::text);
@@ -188,7 +210,7 @@ private:
                     return;
                 }
 
-                // Some servers may send a non-delta lump; support it too.
+                // Non-delta lump
                 if (type == "response.output_audio" && j.contains("audio") && j["audio"].is_string()) {
                     std::string raw = base64_decode(j["audio"].get<std::string>());
                     if (raw.size() >= 2 && onAudio_) {
@@ -198,6 +220,53 @@ private:
                     }
                     return;
                 }
+
+                // ======== Tool/function call handling (robust to minor schema diffs) ========
+                // Common shapes we try to support:
+                // 1) { type: "response.function_call", name: "run_motion", arguments: "{...json...}" }
+                // 2) { type: "response.tool_call", name: "run_motion", arguments: {...} }
+                // 3) { type: "...arguments.delta", name: "run_motion", arguments: "...partial..." }  (best-effort single chunk)
+                // 4) { type: "...", function_call: { name: "run_motion", arguments: "{...}" } }
+                if (tool_cb_) {
+                    std::string fname;
+                    nlohmann::json fargs;
+
+                    if ((type.find("response.function_call") != std::string::npos ||
+                         type.find("response.tool_call") != std::string::npos ||
+                         type.find("arguments") != std::string::npos)) {
+
+                        if (j.contains("name") && j["name"].is_string()) {
+                            fname = j["name"].get<std::string>();
+                        } else if (j.contains("function_call") && j["function_call"].is_object() &&
+                                   j["function_call"].contains("name") && j["function_call"]["name"].is_string()) {
+                            fname = j["function_call"]["name"].get<std::string>();
+                        }
+
+                        if (j.contains("arguments")) {
+                            if (j["arguments"].is_string()) {
+                                // may be a JSON-encoded string
+                                try { fargs = nlohmann::json::parse(j["arguments"].get<std::string>()); }
+                                catch (...) { /* ignore parse error */ }
+                            } else if (j["arguments"].is_object()) {
+                                fargs = j["arguments"];
+                            }
+                        } else if (j.contains("function_call") && j["function_call"].is_object() &&
+                                   j["function_call"].contains("arguments")) {
+                            const auto& a = j["function_call"]["arguments"];
+                            if (a.is_string()) {
+                                try { fargs = nlohmann::json::parse(a.get<std::string>()); } catch (...) {}
+                            } else if (a.is_object()) {
+                                fargs = a;
+                            }
+                        }
+
+                        if (!fname.empty()) {
+                            tool_cb_(fname, fargs);
+                            return;
+                        }
+                    }
+                }
+                // ======== End tool handling ========
 
                 if (type == "response.canceled" || type == "response.completed" ||
                     type == "response.error"    || type == "response.failed") {
@@ -209,7 +278,6 @@ private:
             }
 
             // =================== USER TRANSCRIPTION ONLY ===================
-            // Reset buffer when a new input buffer starts
             if (type == "input_audio_buffer.started") {
                 user_buf_.clear();
                 have_final_text_ = false;
@@ -236,7 +304,6 @@ private:
             }
 
             if (user_completed) {
-                // Some backends send the whole text here. Prefer it and mark final.
                 if (j.contains("text") && j["text"].is_string()) {
                     final_text_ = j["text"].get<std::string>();
                     have_final_text_ = true;
@@ -254,7 +321,6 @@ private:
 
                 if (onUtterance_ && allow) {
                     std::string text = have_final_text_ ? final_text_ : user_buf_;
-                    // de-duplicate accidental doubles like "X.X"
                     if (!text.empty()) {
                         auto mid = text.size()/2;
                         if (text.size()%2==0 && text.substr(0,mid)==text.substr(mid)) text = text.substr(0,mid);
@@ -296,6 +362,7 @@ private:
     AudioCallback onAudio_;
     TranscriptCallback onTranscript_;
     UtteranceCallback onUtterance_;
+    ToolCallback tool_cb_;
     std::function<bool()> responseGate_;
     std::string instructions_;
     bool auto_respond_ = false;
