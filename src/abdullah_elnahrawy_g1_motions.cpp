@@ -351,9 +351,9 @@ Notes:
 // =================== MAIN ===================
 int main(int argc, char const *argv[]) {
 // Print project branding
-std::cout << PROJECT_NAME << " — " << PROJECT_AUTHOR
-          << " (" << PROJECT_SEMVER << ")\n";
-std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
+// std::cout << PROJECT_NAME << " — " << PROJECT_AUTHOR
+//           << " (" << PROJECT_SEMVER << ")\n";
+// std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
 
 
   if (argc < 2) {
