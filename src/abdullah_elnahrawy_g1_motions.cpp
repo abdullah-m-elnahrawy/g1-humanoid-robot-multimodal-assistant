@@ -381,29 +381,28 @@ std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
 
   if (!loadMotionRegistry(registryPath)) return 1;
 
-  // If --say provided, choose best motion BUT REQUIRE its own threshold
-  bool hadSay = !sayPhrase.empty();
-  if (hadSay) {
+  // If --say provided, fuzzy-pick a file from registry triggers, RESPECTING per-motion thresholds.
+  if (!sayPhrase.empty()) {
     std::string in = toLowerAndTrim(sayPhrase);
-    std::string bestFile;
-    double bestScore = -1.0;
-    double bestRequired = 1.0;
+    std::string bestFile; double bestScore = -1.0; double bestThresh = 1.0;
 
-    for (auto &m : motionRegistry) {
-      double motionBest = -1.0;
-      for (auto &t : m.triggers) {
+    for (const auto &m : motionRegistry) {
+      for (const auto &t : m.triggers) {
         int dist = levenshteinDistance(in, toLowerAndTrim(t));
         double sim = 1.0 - (double)dist / std::max(in.size(), t.size());
-        if (sim > motionBest) motionBest = sim;
-      }
-      if (motionBest >= m.fuzzy_threshold && motionBest > bestScore) {
-        bestScore = motionBest;
-        bestFile  = m.file_name;
-        bestRequired = m.fuzzy_threshold;
+        if (sim > bestScore) {
+          bestScore = sim;
+          bestFile  = m.file_name;
+          bestThresh = m.fuzzy_threshold;
+        }
       }
     }
-    if (!bestFile.empty()) {
+
+    if (!bestFile.empty() && bestScore >= bestThresh) {
       playFile = bestFile;
+    } else {
+      std::cout << "No motion matched (best similarity=" << bestScore << " < threshold=" << bestThresh << ").\n";
+      return 2; // explicit non-match exit code for callers
     }
   }
 
@@ -422,12 +421,6 @@ std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
     while (robot.IsRunning()) { usleep(10000); }
 
     return 0;
-  }
-
-  // If we were invoked with --say but nothing met its threshold, exit with a non-zero code.
-  if (hadSay && playFile.empty()) {
-    std::cerr << "No motion matched \"" << sayPhrase << "\" above its threshold.\n";
-    return 2;
   }
 
   // --- Interactive menu (legacy) ---

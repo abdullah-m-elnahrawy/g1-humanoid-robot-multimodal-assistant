@@ -20,6 +20,10 @@ DEFAULT_MCAST_PORT="5555"
 DEFAULT_VAD_THRESHOLD="900"
 DEFAULT_VAD_START_FRAMES="3"
 
+# Intent router defaults (runtime-tunable; app also reads config/runtime.env)
+DEFAULT_INTENT_STRATEGY="openai_only"      # openai_only | local_first | openai_first
+DEFAULT_OPENAI_INTENT_TIMEOUT_MS="250"     # used when openai_first
+
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 API_KEY_FILE="${CONFIG_HOME}/openai/api_key"
 
@@ -71,6 +75,10 @@ export VAD_MIN_VOICE_FRMS="${VAD_MIN_VOICE_FRMS:-$DEFAULT_VAD_START_FRAMES}"
 
 # Optional wake-word name (unused when WAKEWORD_REQUIRED=0)
 export WAKEWORD="${WAKEWORD:-hasan}"
+
+# Intent strategy (optional; can also be set in config/runtime.env without rebuild)
+export INTENT_STRATEGY="${INTENT_STRATEGY:-$DEFAULT_INTENT_STRATEGY}"
+export OPENAI_INTENT_TIMEOUT_MS="${OPENAI_INTENT_TIMEOUT_MS:-$DEFAULT_OPENAI_INTENT_TIMEOUT_MS}"
 
 # ---------- Build ----------
 if (( CLEAN )) && [[ -d "${BUILD_DIR}" ]]; then
@@ -134,17 +142,19 @@ fi
 # ---------- Run ----------
 echo
 echo "=============================================="
-echo " OPENAI_REALTIME_MODEL = ${OPENAI_REALTIME_MODEL}"
-echo " ROBOT_IFACE           = ${ROBOT_IFACE}"
-echo " ROBOT_MCAST_IP        = ${ROBOT_MCAST_IP}   (note: current code uses #defines)"
-echo " ROBOT_MCAST_PORT      = ${ROBOT_MCAST_PORT} (note: current code uses #defines)"
-echo " AUTO_RESPOND          = ${AUTO_RESPOND}"
-echo " WAKEWORD_REQUIRED     = ${WAKEWORD_REQUIRED}"
-echo " ASR_LANG              = ${ASR_LANG}"
-echo " PRINT_TRANSCRIPT      = ${PRINT_TRANSCRIPT}"
-echo " VAD_THRESHOLD_RMS     = ${VAD_THRESHOLD_RMS}"
-echo " VAD_MIN_VOICE_FRMS    = ${VAD_MIN_VOICE_FRMS}"
-echo " WAKEWORD              = ${WAKEWORD}"
+echo " OPENAI_REALTIME_MODEL   = ${OPENAI_REALTIME_MODEL}"
+echo " ROBOT_IFACE             = ${ROBOT_IFACE}"
+echo " ROBOT_MCAST_IP          = ${ROBOT_MCAST_IP}   (note: current code uses #defines)"
+echo " ROBOT_MCAST_PORT        = ${ROBOT_MCAST_PORT} (note: current code uses #defines)"
+echo " AUTO_RESPOND            = ${AUTO_RESPOND}"
+echo " WAKEWORD_REQUIRED       = ${WAKEWORD_REQUIRED}"
+echo " ASR_LANG                = ${ASR_LANG}"
+echo " PRINT_TRANSCRIPT        = ${PRINT_TRANSCRIPT}"
+echo " VAD_THRESHOLD_RMS       = ${VAD_THRESHOLD_RMS}"
+echo " VAD_MIN_VOICE_FRMS      = ${VAD_MIN_VOICE_FRMS}"
+echo " WAKEWORD                = ${WAKEWORD}"
+echo " INTENT_STRATEGY         = ${INTENT_STRATEGY}"
+echo " OPENAI_INTENT_TIMEOUT_MS= ${OPENAI_INTENT_TIMEOUT_MS}"
 echo "----------------------------------------------"
 echo "Running voice interface…"
 echo "=============================================="

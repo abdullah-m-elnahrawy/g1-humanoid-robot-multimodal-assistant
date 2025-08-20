@@ -39,6 +39,42 @@ public:
     void setResponseGate(std::function<bool()> fn) { responseGate_ = std::move(fn); }
     void setToolCallback(const ToolCallback& cb) { tool_cb_ = cb; }
 
+    // Provide a compact JSON summary of motions_registry.yaml so the model can match on-device definitions
+    // Format suggestion: {"motions":[{"file":"...", "threshold":0.8, "triggers":["...","..."]}, ...]}
+    void setMotionRegistrySummary(const std::string& registry_json) { registry_json_ = registry_json; }
+
+    // Ask OpenAI to arbitrate intent (motion vs. speak) and, if motion, PICK a file from the provided registry.
+    // It should call tool `run_motion` with { phrase: "...", file: "..." }.
+    void requestMotionArbitration(const std::string& utterance) {
+        if (!conn_.lock()) return;
+
+        std::string reg = registry_json_.empty() ? std::string("{\"motions\":[]}") : registry_json_;
+
+        std::string instr =
+            std::string(
+                "You control a humanoid robot named Hasan.\n"
+                "TASK: Decide intent and act:\n"
+                "  • If the user's utterance is an imperative/request for a PHYSICAL GESTURE/MOTION, "
+                "call tool `run_motion`.\n"
+                "    - Use the following registry (JSON) as the authoritative list:\n"
+                "      ") + reg + "\n"
+                "    - Pick the best match, respecting each motion's threshold notionally; include:\n"
+                "        { \"phrase\": short English name of the motion, \"file\": exact file from registry }\n"
+                "    - Do NOT produce any spoken/textual answer in that case.\n"
+                "  • Otherwise (it's Q&A, chit-chat, info, etc.), answer briefly (1–2 sentences) and SPEAK.\n"
+                "User utterance: \"" + utterance + "\"";
+
+        nlohmann::json j = {
+            {"type","response.create"},
+            {"response", {
+                {"instructions", instr},
+                {"voice", "alloy"},
+                {"modalities", {"audio","text"}}
+            }}
+        };
+        client_.send(conn_, j.dump(), websocketpp::frame::opcode::text);
+    }
+
     bool start() {
         try {
             client_.clear_access_channels(websocketpp::log::alevel::all);
@@ -142,21 +178,28 @@ private:
 
         std::string instr = instructions_.empty()
           ? "You control a humanoid robot named Hasan.\n"
-            "- If the user issues an imperative or request to perform a PHYSICAL GESTURE/MOTION (e.g., handshake, military salute, wave, bow, sit, stand, welcome visitors, etc.), call the tool `run_motion` with a short English `phrase` describing the motion (e.g., \"shake hands\", \"perform military salute\").\n"
-            "- Otherwise, answer briefly and clearly (1–2 sentences) and speak.\n"
+            "- If the user issues an imperative or request to perform a PHYSICAL GESTURE/MOTION, "
+            "call the tool `run_motion` with a short English `phrase` and, if possible, the exact `file` from the provided registry.\n"
+            "- Otherwise, answer briefly and speak.\n"
             "Do not require a wake word unless the user uses it."
           : instructions_;
 
-        // Expose a single function-style tool the model can call
+        if (!registry_json_.empty()) {
+            instr += "\n\nMotion registry (read-only JSON, authoritative for matching):\n";
+            instr += registry_json_;
+        }
+
+        // Expose a function-style tool the model can call
         nlohmann::json tools = nlohmann::json::array({
             {
                 {"type","function"},
                 {"name","run_motion"},
-                {"description","Trigger a predefined robot motion by phrase (the robot will choose the best matching sequence from its registry)."},
+                {"description","Trigger a predefined robot motion. Choose the best match from the given registry."},
                 {"parameters", {
                     {"type","object"},
                     {"properties", {
-                        {"phrase", {{"type","string"}, {"description","Concise English instruction for the motion, e.g., 'shake hands', 'perform military salute', 'welcome visitors'."}}}
+                        {"phrase", {{"type","string"}, {"description","Concise English instruction of the motion, e.g., 'shake hands', 'perform military salute'."}}},
+                        {"file",   {{"type","string"}, {"description","Exact file name from the registry, e.g., 'shake_hands.seq'."}}}
                     }},
                     {"required", {"phrase"}}
                 }}
@@ -221,12 +264,7 @@ private:
                     return;
                 }
 
-                // ======== Tool/function call handling (robust to minor schema diffs) ========
-                // Common shapes we try to support:
-                // 1) { type: "response.function_call", name: "run_motion", arguments: "{...json...}" }
-                // 2) { type: "response.tool_call", name: "run_motion", arguments: {...} }
-                // 3) { type: "...arguments.delta", name: "run_motion", arguments: "...partial..." }  (best-effort single chunk)
-                // 4) { type: "...", function_call: { name: "run_motion", arguments: "{...}" } }
+                // ======== Tool/function call handling ========
                 if (tool_cb_) {
                     std::string fname;
                     nlohmann::json fargs;
@@ -244,9 +282,8 @@ private:
 
                         if (j.contains("arguments")) {
                             if (j["arguments"].is_string()) {
-                                // may be a JSON-encoded string
                                 try { fargs = nlohmann::json::parse(j["arguments"].get<std::string>()); }
-                                catch (...) { /* ignore parse error */ }
+                                catch (...) {}
                             } else if (j["arguments"].is_object()) {
                                 fargs = j["arguments"];
                             }
@@ -375,4 +412,7 @@ private:
     // assistant state
     std::atomic<bool> response_inflight_{false};
     std::string inflight_id_;
+
+    // registry summary (as JSON string)
+    std::string registry_json_;
 };

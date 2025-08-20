@@ -114,7 +114,8 @@ static void load_runtime_env_from_config() {
         "ASR_LANG",
         "VAD_THRESHOLD_RMS",
         "PRINT_TRANSCRIPT",
-        "WAKEWORD"
+        "WAKEWORD",
+        "INTENT_STRATEGY"          // ← allow runtime switch without rebuild
         // NOTE: OPENAI_API_KEY is intentionally NOT allowed here
     };
 
@@ -166,6 +167,7 @@ static void bootstrap_env_defaults() {
     set_default_env("ASR_LANG", "auto");
     set_default_env("VAD_THRESHOLD_RMS", "900");
     set_default_env("PRINT_TRANSCRIPT", "1");
+    set_default_env("INTENT_STRATEGY", "openai_only"); // ← default
 
     // 3) API key from user config if needed (never from project config)
     const char* api_env = std::getenv("OPENAI_API_KEY");
@@ -182,15 +184,43 @@ static void bootstrap_env_defaults() {
     }
 }
 
-// Return code from motion runner
-static int run_motion_by_phrase(const std::string& phrase) {
+// Build a compact JSON summary of config/motions_registry.yaml for the model
+static std::string build_registry_summary_json() {
+    try {
+        fs::path registry = fs::path(PROJECT_SOURCE_DIR) / "config" / "motions_registry.yaml";
+        YAML::Node root = YAML::LoadFile(registry.string());
+        json j;
+        j["motions"] = json::array();
+        for (const auto& m : root["motions"]) {
+            json item;
+            item["file"] = m["file"].as<std::string>();
+            item["threshold"] = m["threshold"] ? m["threshold"].as<double>() : 0.75;
+            item["triggers"] = json::array();
+            for (const auto& t : m["triggers"]) item["triggers"].push_back(t.as<std::string>());
+            j["motions"].push_back(item);
+        }
+        return j.dump();
+    } catch (...) {
+        return std::string();
+    }
+}
+
+static void run_motion_by_phrase(const std::string& phrase) {
     std::string iface = std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0";
     fs::path motion_bin = self_dir() / "abdullah_elnahrawy_g1_motions";
     std::cout << "Executing motion via phrase: " << phrase << std::endl;
     std::string cmd = "\"" + motion_bin.string() + "\" " + iface + " --say \"" + phrase + "\"";
     int ret = std::system(cmd.c_str());
     if (ret != 0) std::cerr << "[WARN] runner exited with code " << ret << std::endl;
-    return ret;
+}
+
+static void run_motion_by_file(const std::string& file) {
+    std::string iface = std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0";
+    fs::path motion_bin = self_dir() / "abdullah_elnahrawy_g1_motions";
+    std::cout << "Executing motion via file: " << file << std::endl;
+    std::string cmd = "\"" + motion_bin.string() + "\" " + iface + " --play \"" + file + "\"";
+    int ret = std::system(cmd.c_str());
+    if (ret != 0) std::cerr << "[WARN] runner exited with code " << ret << std::endl;
 }
 
 static std::string lowercase(std::string s) {
@@ -233,34 +263,6 @@ struct MotionIntent {
     bool is_motion = false;
     std::string english_cmd;
 };
-
-static MotionIntent detect_motion_intent(const std::string& raw) {
-    MotionIntent m;
-    std::string t = strip_robot_name(raw);
-    std::string tl = lowercase(t);
-
-    // Arabic
-    if (t.find("صافح") != std::string::npos || t.find("سلم علي") != std::string::npos || t.find("مصافحة") != std::string::npos) {
-        m.is_motion = true; m.english_cmd = "shake hands"; return m;
-    }
-    if (t.find("تحية عسكرية") != std::string::npos || t.find("سلام عسكري") != std::string::npos || t.find("حيي") != std::string::npos) {
-        m.is_motion = true; m.english_cmd = "perform military salute"; return m;
-    }
-    if (t.find("لوح") != std::string::npos || t.find("لوّح") != std::string::npos) { m.is_motion = true; m.english_cmd = "wave hand"; return m; }
-    if (t.find("انحني") != std::string::npos || t.find("انحناء") != std::string::npos) { m.is_motion = true; m.english_cmd = "bow"; return m; }
-    if (t.find("اجلس") != std::string::npos) { m.is_motion = true; m.english_cmd = "sit down"; return m; }
-    if (t.find("قف") != std::string::npos || t.find("انهض") != std::string::npos) { m.is_motion = true; m.english_cmd = "stand up"; return m; }
-
-    // English
-    if (tl.find("shake hand") != std::string::npos || tl.find("handshake") != std::string::npos) { m.is_motion = true; m.english_cmd = "shake hands"; return m; }
-    if (tl.find("salute") != std::string::npos) { m.is_motion = true; m.english_cmd = "perform military salute"; return m; }
-    if (tl.find("wave") != std::string::npos) { m.is_motion = true; m.english_cmd = "wave hand"; return m; }
-    if (tl.find("bow") != std::string::npos) { m.is_motion = true; m.english_cmd = "bow"; return m; }
-    if (tl.find("sit") != std::string::npos) { m.is_motion = true; m.english_cmd = "sit down"; return m; }
-    if (tl.find("stand") != std::string::npos) { m.is_motion = true; m.english_cmd = "stand up"; return m; }
-
-    return m;
-}
 
 // ---------- playback ----------
 static void feed_apm_aec(const std::vector<int16_t>& pcm16) {
@@ -419,7 +421,28 @@ static void thread_mic() {
     close(sock); sock = -1;
 }
 
-// ---------- utterance handler ----------
+// ---- Arbitration state for openai_first fallback ----
+static std::atomic<int>  g_arb_epoch{0};
+static std::atomic<bool> g_arb_motion_called{false};
+
+// Try local YAML fuzzy match by passing the utterance to the motion runner's --say path.
+// The runner now returns exit code 2 if no match >= threshold.
+static bool attempt_local_registry_match(const std::string& utterance) {
+    std::string iface = std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0";
+    fs::path motion_bin = self_dir() / "abdullah_elnahrawy_g1_motions";
+    std::string cmd = "\"" + motion_bin.string() + "\" " + iface + " --say \"" + utterance + "\"";
+    int ret = std::system(cmd.c_str());
+    if (ret == 0) return true;        // played
+    std::cout << "[LocalMatch] No motion matched locally (ret=" << ret << ")\n";
+    return false;
+}
+
+// Optional: show user-only transcript deltas
+static void onTranscriptDelta(const std::string& s) {
+    if (print_transcript) std::cout << "📝 [Transcript] " << s << std::endl;
+}
+
+// ---------- utterance handler with strategy ----------
 static void onUtteranceCommit(const std::string& full_text) {
     if (full_text.empty()) return;
 
@@ -441,38 +464,35 @@ static void onUtteranceCommit(const std::string& full_text) {
 
     if (print_transcript) std::cout << "📝 [Utterance] " << trimmed << std::endl;
 
-    // 1) Local deterministic fast path
-    MotionIntent intent = detect_motion_intent(trimmed);
-    if (intent.is_motion) {
-        int rc = run_motion_by_phrase(std::string("hasan, ") + intent.english_cmd);
-        if (rc == 0) return;  // motion executed
-        // if runner refused (no threshold match), continue to fallback/model path
+    std::string strategy = std::getenv("INTENT_STRATEGY") ? lowercase(std::getenv("INTENT_STRATEGY")) : std::string("openai_only");
+
+    if (strategy == "local_first") {
+        // 1) Try local YAML fuzzy matching (respects thresholds). If matched → run motion (no speaking).
+        if (attempt_local_registry_match(trimmed)) return;
+
+        // 2) Else ask OpenAI to arbitrate & match using the same registry (it will either call run_motion or speak).
+        if (rt) rt->requestMotionArbitration(trimmed);
+        return;
     }
 
-    // 2) Data-driven fallback (YAML fuzzy): try the whole utterance
-    {
-        int rc = run_motion_by_phrase(trimmed);
-        if (rc == 0) return;  // matched a YAML trigger above threshold and executed
+    if (strategy == "openai_first") {
+        int my_epoch = ++g_arb_epoch;
+        g_arb_motion_called.store(false);
+
+        if (rt) rt->requestMotionArbitration(trimmed);
+
+        // Fallback timer: if model didn't call the motion tool promptly, try local YAML match.
+        std::thread([my_epoch, text = trimmed](){
+            std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+            if (g_arb_epoch.load() == my_epoch && !g_arb_motion_called.load() && !shutdown_requested.load()) {
+                attempt_local_registry_match(text);
+            }
+        }).detach();
+        return;
     }
 
-    // 3) Ask the model to decide and either call the tool run_motion or speak briefly
-    bool ar = looks_arabic(trimmed);
-    std::string instr = ar
-        ? std::string("أجب بإيجاز شديد (جملة أو جملتين) وبالعربية الفصحى. "
-                      "إذا كان المستخدم يطلب حركة جسدية واضحة، فاستدع أداة run_motion مع خاصية phrase بوصف إنجليزي قصير للحركة. "
-                      "وإلا تحدث بإجابة قصيرة. نص المستخدم: ") + trimmed
-        : std::string("Answer briefly (1–2 sentences). "
-                      "If the user is asking the robot to perform a physical motion, call the tool `run_motion` with a short English `phrase` describing it. "
-                      "Otherwise just speak a short answer. User said: ") + trimmed;
-
-    if (rt && !rt->responseInFlight()) {
-        rt->createSpeakResponse(instr, "alloy");
-    }
-}
-
-// Optional: show user-only transcript deltas
-static void onTranscriptDelta(const std::string& s) {
-    if (print_transcript) std::cout << "📝 [Transcript] " << s << std::endl;
+    // Default: openai_only
+    if (rt) rt->requestMotionArbitration(trimmed);
 }
 
 // ---------- main ----------
@@ -493,7 +513,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, [](int){ shutdown_requested=true; queue_cv.notify_all(); std::cout << "\n[Signal] Received signal 15, shutting down gracefully...\n"; });
 
     std::cout << "=== Enhanced Real-Time Voice Chat System (Router Mode) ===\n";
-    std::cout << "Features: Multi-threaded audio processing, real-time analysis, motion routing (no wakeword by default)\n";
+    std::cout << "Features: Multi-threaded audio processing, real-time analysis, motion routing with selectable arbitration strategy\n";
 
     try {
         std::cout << "[Init] Initializing Unitree middleware on " << argv[1] << "...\n";
@@ -522,22 +542,29 @@ int main(int argc, char **argv) {
         std::cout << "[Init] Connecting to voice server (OpenAI protocol)...\n";
         rt = std::make_unique<RealtimeOpenAI>(apiKey, onAssistantAudio, onTranscriptDelta, onUtteranceCommit);
 
-        // Session-level instructions enable tool-calling for motions
-        rt->setInstructions(
-            "You control a humanoid robot named Hasan.\n"
-            "- If the user issues an imperative/request to perform a PHYSICAL MOTION (e.g., handshake, military salute, wave, bow, sit, stand, welcome visitors), call the tool `run_motion` with a short English `phrase` describing the motion.\n"
-            "- Otherwise, speak a brief answer (1–2 sentences).\n"
-            "Keep latency low and avoid long preambles."
-        );
+        // Provide motion registry summary so the model can match YAML on-device definitions
+        std::string registry_json = build_registry_summary_json();
+        rt->setMotionRegistrySummary(registry_json);
 
-        // If model calls our tool, execute locally via the motion runner (YAML thresholds enforced there)
+        // Tool callback: OpenAI calls run_motion → we execute either by file (preferred) or phrase
         rt->setToolCallback([](const std::string& name, const json& args){
-            if (name == "run_motion") {
-                std::string phrase = args.value("phrase", "");
-                if (!phrase.empty()) {
-                    // prefix the robot name (helps deterministic stripping in the runner triggers, if any)
-                    (void)run_motion_by_phrase(std::string("hasan, ") + phrase);
-                }
+            if (name != "run_motion") return;
+            g_arb_motion_called.store(true);
+
+            // barge-in protection
+            if (is_playing.load()) { cancel_playback.store(true); clear_playback_queue(); }
+            if (rt && rt->responseInFlight()) { rt->cancelInFlight(); }
+
+            std::string file  = args.contains("file")   && args["file"].is_string()   ? args["file"].get<std::string>()   : "";
+            std::string phrase= args.contains("phrase") && args["phrase"].is_string() ? args["phrase"].get<std::string>() : "";
+
+            if (!file.empty()) {
+                run_motion_by_file(file);
+            } else if (!phrase.empty()) {
+                // Model didn't choose a file — let the local runner pick based on phrase
+                run_motion_by_phrase("hasan, " + phrase);
+            } else {
+                std::cerr << "[Tool] run_motion called without usable args.\n";
             }
         });
 
@@ -550,9 +577,9 @@ int main(int argc, char **argv) {
 
         std::cout << "\n=== System Ready ===\n";
         std::cout << "🎤 Audio capture: ACTIVE (client HPF+gate+AEC → server VAD)\n";
-        std::cout << "📝 Utterance routing: ACTIVE (Arabic/English, no wakeword)\n";
+        std::cout << "🧠 Intent strategy: " << (std::getenv("INTENT_STRATEGY") ? std::getenv("INTENT_STRATEGY") : "openai_only") << "\n";
         std::cout << "📡 OpenAI streaming: ACTIVE (buffered TTS playback)\n";
-        std::cout << "🤖 Motion routing: ACTIVE (deterministic → YAML fuzzy → model tool)\n";
+        std::cout << "🤖 Motion routing: ACTIVE (OpenAI and/or Local per strategy)\n";
         std::cout << "Wake word required: " << (wake_required ? "YES" : "NO") << "\n";
         std::cout << "Press Ctrl-C to quit\n\n";
 
