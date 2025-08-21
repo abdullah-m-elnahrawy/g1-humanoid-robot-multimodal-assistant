@@ -187,18 +187,25 @@ private:
             "Do not require a wake word unless the user uses it."
           : instructions_;
 
+        // NEW: Surface the registry at session level so the model can select an exact file
+        if (!motion_registry_summary_.empty()) {
+            instr += "\n\nMotion registry (read-only JSON, authoritative for matching):\n";
+            instr += motion_registry_summary_;
+        }
+
         // Expose a single function-style tool the model can call
         nlohmann::json tools = nlohmann::json::array({
             {
                 {"type","function"},
                 {"name","run_motion"},
-                {"description","Trigger a predefined robot motion by phrase (the robot will choose the best matching sequence from its registry)."},
+                {"description","Trigger a predefined robot motion by phrase and file."},
                 {"parameters", {
                     {"type","object"},
                     {"properties", {
-                        {"phrase", {{"type","string"}, {"description","Concise English instruction for the motion, e.g., 'shake hands', 'perform military salute', 'welcome visitors'."}}}
+                        {"phrase", {{"type","string"}, {"description","Concise English instruction for the motion, e.g., 'shake hands', 'perform military salute', 'welcome visitors'."}}},
+                        {"file",   {{"type","string"}, {"description","Exact file name from the registry, e.g., 'military_salute.seq'."}}}
                     }},
-                    {"required", {"phrase"}}
+                    {"required", {"phrase","file"}}
                 }}
             }
         });
