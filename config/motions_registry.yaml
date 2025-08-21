@@ -9,7 +9,12 @@ motions:
   - يا حسن سلم عليا
   - حسن صافحني
   - صافحني يا حسن
-  threshold: 0.8
+  - سلم علي يا حسن
+  - حسن سلم عليا
+  - حسن سلم علي
+  - حسن صافحني
+  - حسن سلم عليا
+  threshold: 0.7
 
 - file: military_salute.seq
   triggers:

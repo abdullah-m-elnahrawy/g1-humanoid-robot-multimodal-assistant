@@ -16,10 +16,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
+#include <cstring>   // for memcpy
 
 class RealtimeOpenAI {
 public:
-    using AudioCallback      = std::function<void(const std::vector<int16_t>&)>; // 24k PCM, may be small streaming chunks
+    using AudioCallback      = std::function<void(const std::vector<int16_t>&)>; // 24k PCM, delivered once per reply
     using TranscriptCallback = std::function<void(const std::string&)>;          // user transcript deltas (optional)
     using UtteranceCallback  = std::function<void(const std::string&)>;          // final user utterance (once per VAD)
     using ToolCallback       = std::function<void(const std::string& /*name*/, const nlohmann::json& /*args*/)>;
@@ -39,16 +40,17 @@ public:
     void setResponseGate(std::function<bool()> fn) { responseGate_ = std::move(fn); }
     void setToolCallback(const ToolCallback& cb) { tool_cb_ = cb; }
 
+    // === RESTORED PUBLIC APIS (used by voice_interface.cpp) ===
     // Provide a compact JSON summary of motions_registry.yaml so the model can match on-device definitions
     // Format suggestion: {"motions":[{"file":"...", "threshold":0.8, "triggers":["...","..."]}, ...]}
-    void setMotionRegistrySummary(const std::string& registry_json) { registry_json_ = registry_json; }
-
+    void setMotionRegistrySummary(const std::string& json_summary) { motion_registry_summary_ = json_summary; }
+    
     // Ask OpenAI to arbitrate intent (motion vs. speak) and, if motion, PICK a file from the provided registry.
     // It should call tool `run_motion` with { phrase: "...", file: "..." }.
     void requestMotionArbitration(const std::string& utterance) {
         if (!conn_.lock()) return;
 
-        std::string reg = registry_json_.empty() ? std::string("{\"motions\":[]}") : registry_json_;
+        std::string reg = motion_registry_summary_.empty() ? std::string("{\"motions\":[]}") : motion_registry_summary_;
 
         std::string instr =
             std::string(
@@ -74,6 +76,8 @@ public:
         };
         client_.send(conn_, j.dump(), websocketpp::frame::opcode::text);
     }
+
+    // === START/STOP the WebSocket client ==
 
     bool start() {
         try {
@@ -178,28 +182,21 @@ private:
 
         std::string instr = instructions_.empty()
           ? "You control a humanoid robot named Hasan.\n"
-            "- If the user issues an imperative or request to perform a PHYSICAL GESTURE/MOTION, "
-            "call the tool `run_motion` with a short English `phrase` and, if possible, the exact `file` from the provided registry.\n"
-            "- Otherwise, answer briefly and speak.\n"
+            "- If the user issues an imperative or request to perform a PHYSICAL GESTURE/MOTION (e.g., handshake, military salute, wave, bow, sit, stand, welcome visitors, etc.), call the tool `run_motion` with a short English `phrase` describing the motion (e.g., \"shake hands\", \"perform military salute\").\n"
+            "- Otherwise, answer briefly and clearly (1–2 sentences) and speak.\n"
             "Do not require a wake word unless the user uses it."
           : instructions_;
 
-        if (!registry_json_.empty()) {
-            instr += "\n\nMotion registry (read-only JSON, authoritative for matching):\n";
-            instr += registry_json_;
-        }
-
-        // Expose a function-style tool the model can call
+        // Expose a single function-style tool the model can call
         nlohmann::json tools = nlohmann::json::array({
             {
                 {"type","function"},
                 {"name","run_motion"},
-                {"description","Trigger a predefined robot motion. Choose the best match from the given registry."},
+                {"description","Trigger a predefined robot motion by phrase (the robot will choose the best matching sequence from its registry)."},
                 {"parameters", {
                     {"type","object"},
                     {"properties", {
-                        {"phrase", {{"type","string"}, {"description","Concise English instruction of the motion, e.g., 'shake hands', 'perform military salute'."}}},
-                        {"file",   {{"type","string"}, {"description","Exact file name from the registry, e.g., 'shake_hands.seq'."}}}
+                        {"phrase", {{"type","string"}, {"description","Concise English instruction for the motion, e.g., 'shake hands', 'perform military salute', 'welcome visitors'."}}}
                     }},
                     {"required", {"phrase"}}
                 }}
@@ -223,6 +220,58 @@ private:
                asr.c_str(), auto_respond_ ? "on" : "off");
     }
 
+    // --------- Audio accumulation helpers (NEW) ---------
+    static inline int16_t f32_to_i16(float v) {
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        return static_cast<int16_t>(v * 32767.0f);
+    }
+
+    void append_pcm16_base64_(const std::string& b64) {
+        std::string raw = base64_decode(b64);
+        if (raw.size() < 2) return;
+        size_t n = raw.size() / 2;
+        const int16_t* p = reinterpret_cast<const int16_t*>(raw.data());
+        audio_accum_.insert(audio_accum_.end(), p, p + n);
+    }
+
+    void append_float_array_(const nlohmann::json& arr) {
+        if (!arr.is_array() || arr.empty()) return;
+        audio_accum_.reserve(audio_accum_.size() + arr.size());
+        for (const auto& v : arr) {
+            float f = 0.0f;
+            if (v.is_number_float())        f = static_cast<float>(v.get<double>());
+            else if (v.is_number_integer()) f = static_cast<float>(v.get<long long>());
+            else                             continue;
+            audio_accum_.push_back(f32_to_i16(f));
+        }
+    }
+
+    void maybe_accumulate_audio_(const nlohmann::json& j, const char* field) {
+        if (!j.contains(field)) return;
+        const auto& x = j[field];
+        if (x.is_string()) {
+            append_pcm16_base64_(x.get<std::string>());
+        } else if (x.is_array()) {
+            append_float_array_(x);
+        }
+    }
+
+    void flush_accumulated_audio_once_() {
+        if (emitted_this_reply_) return;
+        if (!audio_accum_.empty() && onAudio_) {
+            onAudio_(audio_accum_); // one contiguous 24k PCM16 vector
+        }
+        emitted_this_reply_ = true;
+        audio_accum_.clear();
+        audio_accum_.shrink_to_fit(); // prevent memory growth across turns
+    }
+
+    void reset_reply_audio_state_() {
+        audio_accum_.clear();
+        emitted_this_reply_ = false;
+    }
+
     void handleMessage(const std::string& payload) {
         try {
             auto j = nlohmann::json::parse(payload);
@@ -231,8 +280,9 @@ private:
 
             // =================== ASSISTANT RESPONSES ===================
             if (type.rfind("response.", 0) == 0) {
-                // Track response id state
                 if (type == "response.created") {
+                    reset_reply_audio_state_(); // NEW: start fresh for this reply
+
                     if (j.contains("response") && j["response"].is_object() && j["response"].contains("id") && j["response"]["id"].is_string())
                         inflight_id_ = j["response"]["id"].get<std::string>();
                     else if (j.contains("id") && j["id"].is_string())
@@ -241,30 +291,30 @@ private:
                     return;
                 }
 
-                // Stream audio deltas immediately to the speaker (low latency)
-                if ((type == "response.output_audio.delta" || type == "response.audio.delta") &&
-                    j.contains("delta") && j["delta"].is_string()) {
-                    std::string raw = base64_decode(j["delta"].get<std::string>());
-                    if (raw.size() >= 2 && onAudio_) {
-                        const int16_t* p = reinterpret_cast<const int16_t*>(raw.data());
-                        size_t n = raw.size() / 2;
-                        onAudio_(std::vector<int16_t>(p, p + n)); // 24k PCM
+                // ======== AUDIO CHUNKS (ACCUMULATION) ========
+                if ((type == "response.output_audio.delta" || type == "response.audio.delta") && j.contains("delta")) {
+                    maybe_accumulate_audio_(j, "delta");
+                    return;
+                }
+                if (type == "response.output_audio" && j.contains("audio")) {
+                    maybe_accumulate_audio_(j, "audio");
+                    return;
+                }
+                if (type == "response.delta" && j.contains("output") && j["output"].is_array()) {
+                    for (const auto& out : j["output"]) {
+                        if (out.contains("content") && out["content"].is_array()) {
+                            for (const auto& c : out["content"]) {
+                                if (c.contains("type") && c["type"].is_string() && c["type"] == "audio") {
+                                    if (c.contains("audio")) maybe_accumulate_audio_(c, "audio");
+                                    if (c.contains("data"))  maybe_accumulate_audio_(c, "data");
+                                }
+                            }
+                        }
                     }
                     return;
                 }
 
-                // Non-delta lump
-                if (type == "response.output_audio" && j.contains("audio") && j["audio"].is_string()) {
-                    std::string raw = base64_decode(j["audio"].get<std::string>());
-                    if (raw.size() >= 2 && onAudio_) {
-                        const int16_t* p = reinterpret_cast<const int16_t*>(raw.data());
-                        size_t n = raw.size() / 2;
-                        onAudio_(std::vector<int16_t>(p, p + n));
-                    }
-                    return;
-                }
-
-                // ======== Tool/function call handling ========
+                // ======== Tool/function call handling (unchanged) ========
                 if (tool_cb_) {
                     std::string fname;
                     nlohmann::json fargs;
@@ -283,7 +333,7 @@ private:
                         if (j.contains("arguments")) {
                             if (j["arguments"].is_string()) {
                                 try { fargs = nlohmann::json::parse(j["arguments"].get<std::string>()); }
-                                catch (...) {}
+                                catch (...) { /* ignore parse error */ }
                             } else if (j["arguments"].is_object()) {
                                 fargs = j["arguments"];
                             }
@@ -303,10 +353,16 @@ private:
                         }
                     }
                 }
-                // ======== End tool handling ========
 
+                // ======== Completion / cancellation: emit once and reset ========
+                if (type == "response.audio.done") {
+                    flush_accumulated_audio_once_();
+                    return;
+                }
                 if (type == "response.canceled" || type == "response.completed" ||
-                    type == "response.error"    || type == "response.failed") {
+                    type == "response.error"    || type == "response.failed" ||
+                    type == "response.done") {
+                    flush_accumulated_audio_once_();
                     response_inflight_.store(false);
                     inflight_id_.clear();
                     return;
@@ -413,6 +469,10 @@ private:
     std::atomic<bool> response_inflight_{false};
     std::string inflight_id_;
 
-    // registry summary (as JSON string)
-    std::string registry_json_;
+    // NEW: motion registry JSON provided by app
+    std::string motion_registry_summary_;
+
+    // NEW: per-reply audio accumulator
+    std::vector<int16_t> audio_accum_;
+    bool emitted_this_reply_ = false;
 };
