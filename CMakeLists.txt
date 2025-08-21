@@ -96,7 +96,7 @@ target_include_directories(audio_pipeline
 
 # ---------------- Executables ----------------
 add_executable(abdullah_elnahrawy_g1_motions
-    src/abdullah_elnahrawy_g1_motions.cpp
+    src/g1_motions.cpp
     src/branding_fingerprint.cpp
 )
 add_executable(voice_interface
