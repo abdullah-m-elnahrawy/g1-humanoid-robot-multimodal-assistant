@@ -17,10 +17,11 @@
 #include <cstdio>
 #include <chrono>
 #include <cstring>   // for memcpy
+#include <climits>   // for limits
 
 class RealtimeOpenAI {
 public:
-    using AudioCallback      = std::function<void(const std::vector<int16_t>&)>; // 24k PCM, delivered once per reply
+    using AudioCallback      = std::function<void(const std::vector<int16_t>&)>; // 24k PCM, delivered once per reply or in streaming chunks
     using TranscriptCallback = std::function<void(const std::string&)>;          // user transcript deltas (optional)
     using UtteranceCallback  = std::function<void(const std::string&)>;          // final user utterance (once per VAD)
     using ToolCallback       = std::function<void(const std::string& /*name*/, const nlohmann::json& /*args*/)>;
@@ -32,6 +33,17 @@ public:
         : api_key_(api_key), onAudio_(onAudio), onTranscript_(onTranscript), onUtterance_(onUtterance) {
         const char* ar = std::getenv("AUTO_RESPOND");
         auto_respond_ = (ar && (*ar=='1' || std::string(ar)=="on"));
+
+        // NEW: load streaming flush threshold (24k samples). 0 == disabled (legacy behavior)
+        const char* fs = std::getenv("ASSISTANT_FLUSH_SAMPLES");
+        if (fs && *fs) {
+            long v = std::strtol(fs, nullptr, 10);
+            if (v < 0) v = 0;
+            if (v > 1000000L) v = 1000000L; // hard cap
+            flush_threshold_samples_ = static_cast<size_t>(v);
+        }
+        printf("[RealtimeOpenAI] Audio flush threshold: %zu samples @24kHz (%s)\n",
+               flush_threshold_samples_, flush_threshold_samples_ ? "streaming mode" : "flush-once");
     }
 
     ~RealtimeOpenAI() { stop(); }
@@ -227,7 +239,7 @@ private:
                asr.c_str(), auto_respond_ ? "on" : "off");
     }
 
-    // --------- Audio accumulation helpers (NEW) ---------
+    // --------- Audio accumulation helpers (UPDATED for streaming flush) ---------
     static inline int16_t f32_to_i16(float v) {
         if (v > 1.0f) v = 1.0f;
         if (v < -1.0f) v = -1.0f;
@@ -262,21 +274,34 @@ private:
         } else if (x.is_array()) {
             append_float_array_(x);
         }
+        // NEW: streaming flush by threshold
+        maybe_flush_by_threshold_();
     }
 
-    void flush_accumulated_audio_once_() {
-        if (emitted_this_reply_) return;
-        if (!audio_accum_.empty() && onAudio_) {
-            onAudio_(audio_accum_); // one contiguous 24k PCM16 vector
+    // NEW: Flush when threshold is reached (streaming low-latency)
+    void maybe_flush_by_threshold_() {
+        if (!onAudio_) return;
+        if (flush_threshold_samples_ == 0) return; // disabled
+        if (audio_accum_.size() >= flush_threshold_samples_) {
+            std::vector<int16_t> chunk;
+            chunk.swap(audio_accum_); // move out to avoid copy; leaves accum empty but capacity retained
+            onAudio_(chunk);
         }
-        emitted_this_reply_ = true;
-        audio_accum_.clear();
-        audio_accum_.shrink_to_fit(); // prevent memory growth across turns
+    }
+
+    // NEW: Final flush for any remainder at end of reply/cancel/error
+    void flush_accumulated_audio_remainder_() {
+        if (!onAudio_) { audio_accum_.clear(); return; }
+        if (!audio_accum_.empty()) {
+            std::vector<int16_t> chunk;
+            chunk.swap(audio_accum_);
+            onAudio_(chunk);
+        }
+        // keep capacity for next turn; no shrink here (avoid churn). It will be reused.
     }
 
     void reset_reply_audio_state_() {
-        audio_accum_.clear();
-        emitted_this_reply_ = false;
+        audio_accum_.clear(); // capacity retained
     }
 
     void handleMessage(const std::string& payload) {
@@ -288,7 +313,7 @@ private:
             // =================== ASSISTANT RESPONSES ===================
             if (type.rfind("response.", 0) == 0) {
                 if (type == "response.created") {
-                    reset_reply_audio_state_(); // NEW: start fresh for this reply
+                    reset_reply_audio_state_(); // start fresh for this reply
 
                     if (j.contains("response") && j["response"].is_object() && j["response"].contains("id") && j["response"]["id"].is_string())
                         inflight_id_ = j["response"]["id"].get<std::string>();
@@ -298,7 +323,7 @@ private:
                     return;
                 }
 
-                // ======== AUDIO CHUNKS (ACCUMULATION) ========
+                // ======== AUDIO CHUNKS (ACCUMULATION + STREAMING FLUSH) ========
                 if ((type == "response.output_audio.delta" || type == "response.audio.delta") && j.contains("delta")) {
                     maybe_accumulate_audio_(j, "delta");
                     return;
@@ -361,15 +386,15 @@ private:
                     }
                 }
 
-                // ======== Completion / cancellation: emit once and reset ========
+                // ======== Completion / cancellation: emit remainder and reset ========
                 if (type == "response.audio.done") {
-                    flush_accumulated_audio_once_();
+                    flush_accumulated_audio_remainder_();
                     return;
                 }
                 if (type == "response.canceled" || type == "response.completed" ||
                     type == "response.error"    || type == "response.failed" ||
                     type == "response.done") {
-                    flush_accumulated_audio_once_();
+                    flush_accumulated_audio_remainder_();
                     response_inflight_.store(false);
                     inflight_id_.clear();
                     return;
@@ -476,10 +501,12 @@ private:
     std::atomic<bool> response_inflight_{false};
     std::string inflight_id_;
 
-    // NEW: motion registry JSON provided by app
+    // motion registry JSON provided by app
     std::string motion_registry_summary_;
 
-    // NEW: per-reply audio accumulator
+    // per-reply audio accumulator (24 kHz PCM16)
     std::vector<int16_t> audio_accum_;
-    bool emitted_this_reply_ = false;
+
+    // NEW: streaming threshold in samples @24k (0 == disabled; flush at reply end only)
+    size_t flush_threshold_samples_ = 50000; // default can be overridden by env
 };

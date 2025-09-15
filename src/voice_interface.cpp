@@ -45,7 +45,7 @@ static std::unique_ptr<AudioProcessingPipeline> g_apm;
 
 static std::atomic<bool> shutdown_requested{false};
 
-static std::queue<std::vector<int16_t>> pcm_queue; // 16k PCM full answers
+static std::queue<std::vector<int16_t>> pcm_queue; // 16k PCM full answers or streaming chunks
 static std::mutex queue_mtx;
 static std::condition_variable queue_cv;
 static std::thread playback_thread;
@@ -115,7 +115,8 @@ static void load_runtime_env_from_config() {
         "VAD_THRESHOLD_RMS",
         "PRINT_TRANSCRIPT",
         "WAKEWORD",
-        "INTENT_STRATEGY"          // ← allow runtime switch without rebuild
+        "INTENT_STRATEGY",          // ← allow runtime switch without rebuild
+        "ASSISTANT_FLUSH_SAMPLES"   // ← NEW: streaming audio flush threshold @24k samples
         // NOTE: OPENAI_API_KEY is intentionally NOT allowed here
     };
 
@@ -168,6 +169,7 @@ static void bootstrap_env_defaults() {
     set_default_env("VAD_THRESHOLD_RMS", "900");
     set_default_env("PRINT_TRANSCRIPT", "1");
     set_default_env("INTENT_STRATEGY", "openai_only"); // ← default
+    set_default_env("ASSISTANT_FLUSH_SAMPLES", "50000"); // ← NEW default (~2.08s @24k). Set 0 to disable streaming flush.
 
     // 3) API key from user config if needed (never from project config)
     const char* api_env = std::getenv("OPENAI_API_KEY");
@@ -596,5 +598,6 @@ int main(int argc, char **argv) {
     } catch (const std::exception& e) {
         std::cerr << "[Fatal Error] " << e.what() << "\n";
         return 1;
-    }
+    } 
 }
+
