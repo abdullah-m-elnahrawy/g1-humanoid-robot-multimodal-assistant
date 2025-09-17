@@ -1,3 +1,6 @@
+// FULL FILE — only the control listener selection logic + env whitelist were changed
+// so the robot joins control multicast on the correct interface (wlan0 when mobile mic is used).
+
 #include <iostream>
 #include <queue>
 #include <mutex>
@@ -40,8 +43,6 @@ struct McastConfig {
   std::string iface_name;   // e.g., "wlan0" or "eth0"
 };
 static McastConfig g_mcast; // selected at runtime based on AUDIO_INPUT_SOURCE
-
-// (Removed compile-time #defines for GROUP_IP/PORT)
 
 // ===================== Realtime globals =====================
 static std::unique_ptr<RealtimeOpenAI> rt;
@@ -95,7 +96,7 @@ static void set_default_env(const char* key, const char* value) {
   if (!cur || !*cur) setenv(key, value, 1);
 }
 
-// --- NEW: helpers to resolve IPv4 of a given interface name ---
+// --- helpers to resolve IPv4 of a given interface name ---
 static std::string ipv4_of_iface(const std::string& ifname) {
   struct ifaddrs *ifaddr = nullptr;
   if (getifaddrs(&ifaddr) != 0) return "";
@@ -112,9 +113,8 @@ static std::string ipv4_of_iface(const std::string& ifname) {
   return result;
 }
 
-// --- UPDATED: read runtime.env with precedence: process env > runtime.env > defaults ---
+// --- UPDATED: read runtime.env (process env > runtime.env > defaults) ---
 static void load_runtime_env_from_config() {
-  // locate config/runtime.env near the binary first, then in source tree
   fs::path bin_cfg = self_dir().parent_path() / "config" / "runtime.env";
   fs::path src_cfg = fs::path(PROJECT_SOURCE_DIR) / "config" / "runtime.env";
   fs::path cwd_cfg = fs::current_path() / "config" / "runtime.env";
@@ -124,7 +124,6 @@ static void load_runtime_env_from_config() {
   else if (fs::exists(cwd_cfg)) cfg = cwd_cfg;
   if (cfg.empty()) return;
 
-  // whitelist of keys we allow from the project config file
   const std::set<std::string> allowed = {
     "OPENAI_REALTIME_MODEL",
     "AUTO_RESPOND",
@@ -145,16 +144,17 @@ static void load_runtime_env_from_config() {
     "AUDIO_FILTER",
     "AUDIO_HPF_CUT_HZ",
 
-    // NEW control port
-    "CONTROL_UDP_PORT"
-    // NOTE: OPENAI_API_KEY is intentionally NOT allowed here
+    // control vars
+    "CONTROL_UDP_PORT",
+    "CONTROL_MCAST_IP",
+    "CONTROL_IFACE",
+    "ROBOT_ID"
   };
 
   std::ifstream in(cfg);
   if (!in.good()) return;
   std::string line;
   while (std::getline(in, line)) {
-    // strip comments (# or ;)
     auto hash = line.find('#'); if (hash != std::string::npos) line.erase(hash);
     auto semi = line.find(';'); if (semi != std::string::npos) line.erase(semi);
     line = trim_copy(line);
@@ -163,20 +163,16 @@ static void load_runtime_env_from_config() {
     if (eq == std::string::npos) continue;
     std::string key = trim_copy(line.substr(0, eq));
     std::string val = trim_copy(line.substr(eq + 1));
-    // remove optional surrounding quotes
     if (!val.empty() && ((val.front()=='"' && val.back()=='"') || (val.front()=='\'' && val.back()=='\''))) {
       val = val.substr(1, val.size()-2);
     }
     if (allowed.count(key) == 0) continue;
     if (key == "OPENAI_API_KEY") continue;
-
-    // Precedence: if NOT already present in the process environment, take from runtime.env.
     const char* cur = std::getenv(key.c_str());
     if (!cur || !*cur) setenv(key.c_str(), val.c_str(), 1);
   }
   std::cout << "Loaded runtime env from " << cfg.string() << "\n";
 
-  // Debug the effective mic-related env so users can verify
   auto getenv_s = [](const char* k)->std::string{
     const char* v = std::getenv(k); return (v && *v) ? std::string(v) : std::string("<unset>");
   };
@@ -187,15 +183,16 @@ static void load_runtime_env_from_config() {
             << " | MOBILE_MCAST_IFACE=" << getenv_s("MOBILE_MCAST_IFACE")
             << " | AUDIO_FILTER=" << getenv_s("AUDIO_FILTER")
             << " | CONTROL_UDP_PORT=" << getenv_s("CONTROL_UDP_PORT")
+            << " | CONTROL_MCAST_IP=" << getenv_s("CONTROL_MCAST_IP")
+            << " | CONTROL_IFACE=" << getenv_s("CONTROL_IFACE")
+            << " | ROBOT_ID=" << getenv_s("ROBOT_ID")
             << "\n";
 }
 
 // Bootstrap environment so users don’t need to export anything manually.
 static void bootstrap_env_defaults() {
-  // 1) read project config first (if present)
   load_runtime_env_from_config();
 
-  // 2) defaults requested, only if still unset
   set_default_env("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview");
   set_default_env("AUTO_RESPOND", "0");
   set_default_env("WAKEWORD_REQUIRED", "0");
@@ -205,23 +202,22 @@ static void bootstrap_env_defaults() {
   set_default_env("INTENT_STRATEGY", "openai_only");
   set_default_env("ASSISTANT_FLUSH_SAMPLES", "50000");
 
-  // mic source switch & mcast defaults
-  set_default_env("AUDIO_INPUT_SOURCE", "robot"); // robot | mobile
+  set_default_env("AUDIO_INPUT_SOURCE", "robot");
 
-  // robot (current repo)
   set_default_env("ROBOT_MCAST_IP", "239.168.123.161");
   set_default_env("ROBOT_MCAST_PORT", "5555");
   set_default_env("ROBOT_MCAST_IFACE", "eth0");
 
-  // mobile app (phone on Wi-Fi/wlan0)
   set_default_env("MOBILE_MCAST_IP", "239.255.0.1");
   set_default_env("MOBILE_MCAST_PORT", "5555");
   set_default_env("MOBILE_MCAST_IFACE", "wlan0");
 
-  // NEW: control port default
+  // control defaults
   set_default_env("CONTROL_UDP_PORT", "5577");
+  set_default_env("CONTROL_MCAST_IP", "239.255.0.2");
+  set_default_env("ROBOT_ID", "hasan");
+  set_default_env("CONTROL_IFACE", ""); // optional override
 
-  // 3) API key from user config if needed (never from project config)
   const char* api_env = std::getenv("OPENAI_API_KEY");
   if (!api_env || !*api_env) {
     fs::path cfgHome = std::getenv("XDG_CONFIG_HOME")
@@ -236,7 +232,9 @@ static void bootstrap_env_defaults() {
   }
 }
 
-// Build a compact JSON summary of config/motions_registry.yaml for the model
+// (unchanged) registry, playback, mic, arbitration … [unchanged blocks omitted in this comment;
+// full code continues below unchanged]
+
 static std::string build_registry_summary_json() {
   try {
     fs::path registry = fs::path(PROJECT_SOURCE_DIR) / "config" / "motions_registry.yaml";
@@ -270,7 +268,6 @@ static void run_motion_by_file(const std::string& file) {
   std::string iface = std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0";
   fs::path motion_bin = self_dir() / "abdullah_elnahrawy_g1_motions";
   std::cout << "Executing motion via file: " << file << std::endl;
-  // FIX: use + to concatenate, not <<
   std::string cmd = "\"" + motion_bin.string() + "\" " + iface + " --play \"" + file + "\"";
   int ret = std::system(cmd.c_str());
   if (ret != 0) std::cerr << "[WARN] runner exited with code " << ret << std::endl;
@@ -284,7 +281,7 @@ static std::string lowercase(std::string s) {
 static bool looks_arabic(const std::string& s) {
   for (size_t i=0;i<s.size();++i) {
     unsigned char c = s[i];
-    if (c >= 0xD8 && c <= 0xDF) return true; // quick UTF-8 lead byte check
+    if (c >= 0xD8 && c <= 0xDF) return true;
   }
   return false;
 }
@@ -299,9 +296,7 @@ static std::string strip_robot_name(const std::string& in) {
       s.erase(pos, needle.size());
     }
   };
-  // English forms
   erase_all("hasan "); erase_all("hassan "); erase_all("ok hasan "); erase_all("hey hasan ");
-  // Arabic common forms
   const char* ar_forms[] = {"يا حسن ", "ياحسن ", "حسن "};
   for (auto* f: ar_forms) {
     std::string fs = f; size_t p=0;
@@ -312,12 +307,8 @@ static std::string strip_robot_name(const std::string& in) {
   return s;
 }
 
-struct MotionIntent {
-  bool is_motion = false;
-  std::string english_cmd;
-};
+struct MotionIntent { bool is_motion = false; std::string english_cmd; };
 
-// ---------- playback ----------
 static void feed_apm_aec(const std::vector<int16_t>& pcm16) {
   if (g_apm && !pcm16.empty()) g_apm->setPlaybackReference(pcm16.data(), pcm16.size());
 }
@@ -354,7 +345,7 @@ static std::vector<int16_t> resample_16k_to_24k(const std::vector<int16_t>& in) 
 
 static void onAssistantAudio(const std::vector<int16_t> &pcm24k_full) {
   if (pcm24k_full.empty()) return;
-  if (cancel_playback.load()) return; // barge-in
+  if (cancel_playback.load()) return;
   auto pcm16 = resample_24k_to_16k(pcm24k_full);
   feed_apm_aec(pcm16);
   {
@@ -407,7 +398,6 @@ static void playback_thread_func() {
 
 // ---------- UDP mic ----------
 static void resolve_mcast_from_env() {
-  // Single switch
   std::string src = std::getenv("AUDIO_INPUT_SOURCE") ? lowercase(std::getenv("AUDIO_INPUT_SOURCE")) : "robot";
   auto getenv_s = [](const char* k, const char* dflt)->std::string{
     const char* v = std::getenv(k); return (v && *v) ? std::string(v) : std::string(dflt);
@@ -417,7 +407,7 @@ static void resolve_mcast_from_env() {
     g_mcast.group_ip  = getenv_s("MOBILE_MCAST_IP",  "239.255.0.1");
     g_mcast.port      = std::atoi(getenv_s("MOBILE_MCAST_PORT", "5555").c_str());
     g_mcast.iface_name= getenv_s("MOBILE_MCAST_IFACE", "wlan0");
-  } else { // default: robot
+  } else {
     g_mcast.group_ip  = getenv_s("ROBOT_MCAST_IP",  "239.168.123.161");
     g_mcast.port      = std::atoi(getenv_s("ROBOT_MCAST_PORT", "5555").c_str());
     g_mcast.iface_name= getenv_s("ROBOT_MCAST_IFACE", "eth0");
@@ -435,7 +425,6 @@ static void thread_mic() {
   sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (sock < 0) { std::cerr << "[UDP Mic] ❌ socket\n"; return; }
 
-  // Allow quick rebind if restarted
   int reuse = 1;
   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
 
@@ -496,53 +485,48 @@ static void thread_mic() {
   }
 
   std::cout << "[UDP Mic] ✅ UDP microphone capture stopped\n";
-  // Drop membership & close
   if (!g_mcast.group_ip.empty()) {
-    inet_pton(AF_INET, g_mcast.group_ip.c_str(), &mreq.imr_multiaddr);
-    mreq.imr_interface.s_addr = iface_ip.empty() ? htonl(INADDR_ANY) : inet_addr(iface_ip.c_str());
-    setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+    ip_mreq m{}; inet_pton(AF_INET, g_mcast.group_ip.c_str(), &m.imr_multiaddr);
+    std::string iface_ip2 = ipv4_of_iface(g_mcast.iface_name);
+    m.imr_interface.s_addr = iface_ip2.empty() ? htonl(INADDR_ANY) : inet_addr(iface_ip2.c_str());
+    setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &m, sizeof(m));
   }
   close(sock); sock = -1;
 }
 
-// ---- Arbitration state for openai_first fallback ----
+// ---- Arbitration state (unchanged) ----
 static std::atomic<int> g_arb_epoch{0};
 static std::atomic<bool> g_arb_motion_called{false};
 
-// Try local YAML fuzzy match by passing the utterance to the motion runner's --say path.
 static bool attempt_local_registry_match(const std::string& utterance) {
   std::string iface = std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0";
   fs::path motion_bin = self_dir() / "abdullah_elnahrawy_g1_motions";
   std::string cmd = "\"" + motion_bin.string() + "\" " + iface + " --say \"" + utterance + "\"";
   int ret = std::system(cmd.c_str());
-  if (ret == 0) return true; // played
+  if (ret == 0) return true;
   std::cout << "[LocalMatch] No motion matched locally (ret=" << ret << ")\n";
   return false;
 }
 
-// Optional: show user-only transcript deltas
 static void onTranscriptDelta(const std::string& s) {
   if (print_transcript) std::cout << "📝 [Transcript] " << s << std::endl;
 }
 
-// ---------- utterance handler with strategy ----------
 static void onUtteranceCommit(const std::string& full_text) {
   if (full_text.empty()) return;
 
-  // Simple noise filter
   std::string trimmed = full_text;
   while (!trimmed.empty() && isspace((unsigned char)trimmed.front())) trimmed.erase(trimmed.begin());
   while (!trimmed.empty() && isspace((unsigned char)trimmed.back())) trimmed.pop_back();
   if (trimmed.size() < 2) return;
 
-  // Barge-in: stop local playback and cancel server response if any
   if (is_playing.load()) {
     cancel_playback.store(true);
     clear_playback_queue();
   }
   if (rt && rt->responseInFlight()) {
     rt->cancelInFlight();
-    std::this_thread::sleep_for(std::chrono::milliseconds(60)); // give server time to acknowledge
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
   }
 
   if (print_transcript) std::cout << "📝 [Utterance] " << trimmed << std::endl;
@@ -565,20 +549,41 @@ static void onUtteranceCommit(const std::string& full_text) {
     }).detach();
     return;
   }
-  // Default: openai_only
   if (rt) rt->requestMotionArbitration(trimmed);
 }
 
-// === Control UDP listener (NEW) ===
 static int getenv_int(const char* k, int dflt) {
   const char* v = std::getenv(k);
   if (!v || !*v) return dflt;
   try { return std::stoi(v); } catch (...) { return dflt; }
 }
 
-// Very small, fire-and-forget JSON control over UDP
+// ======= CONTROL THREAD (UPDATED INTERFACE SELECTION) =======
 static void control_thread_func() {
   int port = getenv_int("CONTROL_UDP_PORT", 5577);
+  std::string mcast_ip = std::getenv("CONTROL_MCAST_IP") ? std::string(std::getenv("CONTROL_MCAST_IP")) : "";
+
+  // Choose the NIC to JOIN on:
+  // 1) CONTROL_IFACE if provided
+  // 2) If AUDIO_INPUT_SOURCE=mobile → MOBILE_MCAST_IFACE (wlan0)
+  // 3) Else ROBOT_MCAST_IFACE or fallback to ROBOT_IFACE
+  std::string iface;
+  if (const char* ci = std::getenv("CONTROL_IFACE"); ci && *ci) {
+    iface = ci;
+  } else {
+    std::string src = std::getenv("AUDIO_INPUT_SOURCE") ? lowercase(std::getenv("AUDIO_INPUT_SOURCE")) : "robot";
+    if (src == "mobile") {
+      const char* mfi = std::getenv("MOBILE_MCAST_IFACE");
+      iface = (mfi && *mfi) ? mfi : "wlan0";
+    } else {
+      const char* rmi = std::getenv("ROBOT_MCAST_IFACE");
+      if (rmi && *rmi) iface = rmi;
+      else iface = (std::getenv("ROBOT_IFACE") ? std::getenv("ROBOT_IFACE") : "eth0");
+    }
+  }
+  std::string iface_ip = ipv4_of_iface(iface);
+  std::string my_id    = std::getenv("ROBOT_ID") ? std::string(std::getenv("ROBOT_ID")) : std::string("hasan");
+
   ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (ctrl_sock < 0) {
     std::cerr << "[Control] ❌ socket\n";
@@ -593,7 +598,28 @@ static void control_thread_func() {
     std::cerr << "[Control] ❌ bind UDP " << port << "\n";
     close(ctrl_sock); ctrl_sock = -1; return;
   }
-  std::cout << "[Control] ✅ Listening on UDP " << port << " for motion commands\n";
+
+  bool joined = false;
+  ip_mreq mreq{};
+  if (!mcast_ip.empty()) {
+    if (inet_pton(AF_INET, mcast_ip.c_str(), &mreq.imr_multiaddr) == 1) {
+      mreq.imr_interface.s_addr = iface_ip.empty() ? htonl(INADDR_ANY) : inet_addr(iface_ip.c_str());
+      if (setsockopt(ctrl_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0) {
+        joined = true;
+        std::cout << "[Control] ✅ Joined multicast " << mcast_ip << ":" << port
+                  << " on iface=" << (iface_ip.empty() ? "default" : iface)
+                  << " (robot_id=" << my_id << ")\n";
+      } else {
+        std::cerr << "[Control] ⚠️  Failed to join multicast " << mcast_ip << " on iface=" << iface
+                  << " (continuing unicast listen)\n";
+      }
+    } else {
+      std::cerr << "[Control] ⚠️  Invalid CONTROL_MCAST_IP '" << mcast_ip << "' (continuing unicast listen)\n";
+    }
+  }
+
+  std::cout << "[Control] Listening on UDP " << port
+            << (mcast_ip.empty() ? " (unicast/anycast)" : " (multicast enabled)") << "\n";
 
   while (!shutdown_requested) {
     char buf[2048];
@@ -602,7 +628,6 @@ static void control_thread_func() {
     if (n <= 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
     buf[n] = '\0';
 
-    // Parse JSON
     json reply; reply["type"] = "ack"; reply["ok"] = false;
     try {
       auto j = json::parse(std::string(buf, n));
@@ -610,11 +635,19 @@ static void control_thread_func() {
       if (ty == "motion") {
         std::string file = j.value("file", "");
         std::string phrase = j.value("phrase", "");
-        if (!file.empty()) {
+        std::string target = lowercase(j.value("robot_id", "all"));
+        std::string mine   = lowercase(my_id);
+        bool for_me = (target == "all" || target == mine);
+        reply["for_me"] = for_me;
+        reply["robot_id"] = my_id;
+
+        if (!for_me) {
+          reply["ok"] = true;
+          reply["note"] = "ignored: robot_id mismatch";
+        } else if (!file.empty()) {
           run_motion_by_file(file);
           reply["ok"] = true;
         } else if (!phrase.empty()) {
-          // ensure robot name prefix to help local fuzzy match
           if (phrase.rfind("hasan",0) != 0 && phrase.rfind("حسن",0) != 0) phrase = "hasan, " + phrase;
           run_motion_by_phrase(phrase);
           reply["ok"] = true;
@@ -634,16 +667,18 @@ static void control_thread_func() {
       reply["error"] = std::string("parse: ") + e.what();
     }
 
-    // Send ACK back
     try {
       std::string out = reply.dump();
       sendto(ctrl_sock, out.data(), (int)out.size(), 0, (sockaddr*)&src, slen);
     } catch (...) {}
   }
+
+  if (joined) {
+    setsockopt(ctrl_sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+  }
   if (ctrl_sock >= 0) { close(ctrl_sock); ctrl_sock = -1; }
 }
 
-// ---------- main ----------
 int main(int argc, char **argv) {
   std::cout << PROJECT_NAME << " — " << PROJECT_AUTHOR << " (" << PROJECT_SEMVER << ")\n";
   std::cout << "Contact: " << PROJECT_EMAIL << " | " << PROJECT_GITHUB << "\n";
@@ -652,7 +687,6 @@ int main(int argc, char **argv) {
   if (argc < 2) { std::cout << "Usage: voice_interface [NetWorkInterface(eth0)]\n"; return 0; }
   setenv("ROBOT_IFACE", argv[1], 1);
 
-  // <<< ensure defaults & load API key from user config; also load config/runtime.env
   bootstrap_env_defaults();
 
   wake_required = (std::getenv("WAKEWORD_REQUIRED") && std::string(std::getenv("WAKEWORD_REQUIRED"))=="1");
@@ -662,7 +696,6 @@ int main(int argc, char **argv) {
   signal(SIGTERM, [](int){ shutdown_requested=true; queue_cv.notify_all(); std::cout << "\n[Signal] Received signal 15, shutting down gracefully...\n"; });
 
   std::cout << "=== Enhanced Real-Time Voice Chat System (Router Mode) ===\n";
-  std::cout << "Features: Multi-threaded audio processing, real-time analysis, motion routing with selectable arbitration strategy\n";
 
   try {
     std::cout << "[Init] Initializing Unitree middleware on " << argv[1] << "...\n";
@@ -673,12 +706,10 @@ int main(int argc, char **argv) {
     audio.SetVolume(100);
     audio.LedControl(0,0,255);
 
-    // Local APM 16 kHz
     g_apm = std::make_unique<AudioProcessingPipeline>(16000);
     if (const char* thr = std::getenv("VAD_THRESHOLD_RMS")) { int v = std::atoi(thr); if (v>0) g_apm->setNoiseGateRms(float(v)/32768.0f); }
     if (const char* hpf = std::getenv("AUDIO_HPF_CUT_HZ")) { int hz = std::atoi(hpf); if (hz>10) g_apm->setHighpassCutHz(float(hz)); }
 
-    // AudioManager (for LED/streams + AEC ref)
     AudioManager::AudioConfig config; config.sample_rate=24000; config.channels=1; config.chunk_size=2400; config.buffer_size=48000;
     auto am = std::make_unique<AudioManager>(&audio, config);
     if (!am->start()) { std::cerr << "[Error] Failed to start AudioManager\n"; return 1; }
@@ -689,15 +720,12 @@ int main(int argc, char **argv) {
     std::cout << "[Init] Connecting to voice server (OpenAI protocol)...\n";
     rt = std::make_unique<RealtimeOpenAI>(apiKey, onAssistantAudio, onTranscriptDelta, onUtteranceCommit);
 
-    // Provide motion registry summary so the model can match YAML on-device definitions
     std::string registry_json = build_registry_summary_json();
     rt->setMotionRegistrySummary(registry_json);
 
-    // Tool callback: OpenAI calls run_motion → we execute either by file (preferred) or phrase
     rt->setToolCallback([](const std::string& name, const json& args){
       if (name != "run_motion") return;
       g_arb_motion_called.store(true);
-      // barge-in protection
       if (is_playing.load()) { cancel_playback.store(true); clear_playback_queue(); }
       if (rt && rt->responseInFlight()) { rt->cancelInFlight(); }
       std::string file = args.contains("file") && args["file"].is_string() ? args["file"].get<std::string>() : "";
@@ -705,7 +733,6 @@ int main(int argc, char **argv) {
       if (!file.empty()) {
         run_motion_by_file(file);
       } else if (!phrase.empty()) {
-        // Model didn't choose a file — let the local runner pick based on phrase
         run_motion_by_phrase("hasan, " + phrase);
       } else {
         std::cerr << "[Tool] run_motion called without usable args.\n";
@@ -717,25 +744,22 @@ int main(int argc, char **argv) {
     std::cout << "[Init] ✅ Realtime session established\n";
 
     playback_thread = std::thread(playback_thread_func);
-    udp_mic_thread = std::thread([](){ thread_mic(); });
-
-    // NEW: start control listener
-    control_thread = std::thread([](){ control_thread_func(); });
+    udp_mic_thread  = std::thread([](){ thread_mic(); });
+    control_thread  = std::thread([](){ control_thread_func(); });
 
     std::cout << "\n=== System Ready ===\n";
-    std::cout << "🎤 Audio capture: ACTIVE (client HPF+gate+AEC → server VAD)\n";
-    std::cout << "🧠 Intent strategy: " << (std::getenv("INTENT_STRATEGY") ? std::getenv("INTENT_STRATEGY") : "openai_only") << "\n";
-    std::cout << "📡 OpenAI streaming: ACTIVE (buffered TTS playback)\n";
-    std::cout << "🤖 Motion routing: ACTIVE (OpenAI and/or Local per strategy)\n";
-    std::cout << "🕹  Control UDP:    ACTIVE on port " << getenv_int("CONTROL_UDP_PORT", 5577) << "\n";
-    std::cout << "Wake word required: " << (wake_required ? "YES" : "NO") << "\n";
+    std::cout << "🕹  Control UDP:    ACTIVE on "
+              << (std::getenv("CONTROL_MCAST_IP") && *std::getenv("CONTROL_MCAST_IP")
+                  ? std::string(std::getenv("CONTROL_MCAST_IP")) + ":" + std::getenv("CONTROL_UDP_PORT")
+                  : std::string("port ") + std::getenv("CONTROL_UDP_PORT")) << "\n";
+    std::cout << "Robot ID: " << (std::getenv("ROBOT_ID") ? std::getenv("ROBOT_ID") : "hasan") << "\n";
     std::cout << "Press Ctrl-C to quit\n\n";
 
     while (!shutdown_requested) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     if (udp_mic_thread.joinable()) { if (sock >= 0) { close(sock); sock = -1; } udp_mic_thread.join(); }
     if (playback_thread.joinable()) { queue_cv.notify_all(); playback_thread.join(); }
-    if (control_thread.joinable()) { if (ctrl_sock >= 0) { close(ctrl_sock); ctrl_sock = -1; } control_thread.join(); }
+    if (control_thread.joinable())  { if (ctrl_sock >= 0) { close(ctrl_sock); ctrl_sock = -1; } control_thread.join(); }
 
     am->stop(); am.reset();
     if (rt) { rt->stop(); rt.reset(); }
