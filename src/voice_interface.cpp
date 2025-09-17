@@ -59,6 +59,10 @@ static int sock = -1;
 static bool wake_required = false;
 static bool print_transcript = false;
 
+// === Control UDP (NEW) ===
+static std::thread control_thread;
+static int ctrl_sock = -1;
+
 // ---------- helpers ----------
 static fs::path self_dir() {
   char buf[4096];
@@ -139,7 +143,10 @@ static void load_runtime_env_from_config() {
 
     // audio front-end knobs
     "AUDIO_FILTER",
-    "AUDIO_HPF_CUT_HZ"
+    "AUDIO_HPF_CUT_HZ",
+
+    // NEW control port
+    "CONTROL_UDP_PORT"
     // NOTE: OPENAI_API_KEY is intentionally NOT allowed here
   };
 
@@ -179,6 +186,7 @@ static void load_runtime_env_from_config() {
             << " | MOBILE_MCAST_IP=" << getenv_s("MOBILE_MCAST_IP")
             << " | MOBILE_MCAST_IFACE=" << getenv_s("MOBILE_MCAST_IFACE")
             << " | AUDIO_FILTER=" << getenv_s("AUDIO_FILTER")
+            << " | CONTROL_UDP_PORT=" << getenv_s("CONTROL_UDP_PORT")
             << "\n";
 }
 
@@ -209,6 +217,9 @@ static void bootstrap_env_defaults() {
   set_default_env("MOBILE_MCAST_IP", "239.255.0.1");
   set_default_env("MOBILE_MCAST_PORT", "5555");
   set_default_env("MOBILE_MCAST_IFACE", "wlan0");
+
+  // NEW: control port default
+  set_default_env("CONTROL_UDP_PORT", "5577");
 
   // 3) API key from user config if needed (never from project config)
   const char* api_env = std::getenv("OPENAI_API_KEY");
@@ -441,7 +452,7 @@ static void thread_mic() {
     std::cout << "[UDP Mic] Local iface " << g_mcast.iface_name << " IPv4: " << iface_ip << std::endl;
   }
 
-  ip_mreq mreq{}; 
+  ip_mreq mreq{};
   if (inet_pton(AF_INET, g_mcast.group_ip.c_str(), &mreq.imr_multiaddr) != 1) {
     std::cerr << "[UDP Mic] ❌ invalid multicast address: " << g_mcast.group_ip << "\n"; close(sock); sock = -1; return;
   }
@@ -558,6 +569,80 @@ static void onUtteranceCommit(const std::string& full_text) {
   if (rt) rt->requestMotionArbitration(trimmed);
 }
 
+// === Control UDP listener (NEW) ===
+static int getenv_int(const char* k, int dflt) {
+  const char* v = std::getenv(k);
+  if (!v || !*v) return dflt;
+  try { return std::stoi(v); } catch (...) { return dflt; }
+}
+
+// Very small, fire-and-forget JSON control over UDP
+static void control_thread_func() {
+  int port = getenv_int("CONTROL_UDP_PORT", 5577);
+  ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (ctrl_sock < 0) {
+    std::cerr << "[Control] ❌ socket\n";
+    return;
+  }
+  int reuse = 1;
+  setsockopt(ctrl_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
+
+  sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = INADDR_ANY;
+  if (bind(ctrl_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    std::cerr << "[Control] ❌ bind UDP " << port << "\n";
+    close(ctrl_sock); ctrl_sock = -1; return;
+  }
+  std::cout << "[Control] ✅ Listening on UDP " << port << " for motion commands\n";
+
+  while (!shutdown_requested) {
+    char buf[2048];
+    sockaddr_in src{}; socklen_t slen = sizeof(src);
+    ssize_t n = recvfrom(ctrl_sock, buf, sizeof(buf)-1, 0, (sockaddr*)&src, &slen);
+    if (n <= 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
+    buf[n] = '\0';
+
+    // Parse JSON
+    json reply; reply["type"] = "ack"; reply["ok"] = false;
+    try {
+      auto j = json::parse(std::string(buf, n));
+      std::string ty = j.value("type", "");
+      if (ty == "motion") {
+        std::string file = j.value("file", "");
+        std::string phrase = j.value("phrase", "");
+        if (!file.empty()) {
+          run_motion_by_file(file);
+          reply["ok"] = true;
+        } else if (!phrase.empty()) {
+          // ensure robot name prefix to help local fuzzy match
+          if (phrase.rfind("hasan",0) != 0 && phrase.rfind("حسن",0) != 0) phrase = "hasan, " + phrase;
+          run_motion_by_phrase(phrase);
+          reply["ok"] = true;
+        } else {
+          reply["error"] = "missing file/phrase";
+        }
+      } else if (ty == "get_registry") {
+        reply["ok"] = true;
+        reply["type"] = "registry";
+        reply["data"] = json::parse(build_registry_summary_json());
+      } else if (ty == "ping") {
+        reply["ok"] = true; reply["type"] = "pong";
+      } else {
+        reply["error"] = "unknown type";
+      }
+    } catch (const std::exception& e) {
+      reply["error"] = std::string("parse: ") + e.what();
+    }
+
+    // Send ACK back
+    try {
+      std::string out = reply.dump();
+      sendto(ctrl_sock, out.data(), (int)out.size(), 0, (sockaddr*)&src, slen);
+    } catch (...) {}
+  }
+  if (ctrl_sock >= 0) { close(ctrl_sock); ctrl_sock = -1; }
+}
+
 // ---------- main ----------
 int main(int argc, char **argv) {
   std::cout << PROJECT_NAME << " — " << PROJECT_AUTHOR << " (" << PROJECT_SEMVER << ")\n";
@@ -634,11 +719,15 @@ int main(int argc, char **argv) {
     playback_thread = std::thread(playback_thread_func);
     udp_mic_thread = std::thread([](){ thread_mic(); });
 
+    // NEW: start control listener
+    control_thread = std::thread([](){ control_thread_func(); });
+
     std::cout << "\n=== System Ready ===\n";
     std::cout << "🎤 Audio capture: ACTIVE (client HPF+gate+AEC → server VAD)\n";
     std::cout << "🧠 Intent strategy: " << (std::getenv("INTENT_STRATEGY") ? std::getenv("INTENT_STRATEGY") : "openai_only") << "\n";
     std::cout << "📡 OpenAI streaming: ACTIVE (buffered TTS playback)\n";
     std::cout << "🤖 Motion routing: ACTIVE (OpenAI and/or Local per strategy)\n";
+    std::cout << "🕹  Control UDP:    ACTIVE on port " << getenv_int("CONTROL_UDP_PORT", 5577) << "\n";
     std::cout << "Wake word required: " << (wake_required ? "YES" : "NO") << "\n";
     std::cout << "Press Ctrl-C to quit\n\n";
 
@@ -646,6 +735,8 @@ int main(int argc, char **argv) {
 
     if (udp_mic_thread.joinable()) { if (sock >= 0) { close(sock); sock = -1; } udp_mic_thread.join(); }
     if (playback_thread.joinable()) { queue_cv.notify_all(); playback_thread.join(); }
+    if (control_thread.joinable()) { if (ctrl_sock >= 0) { close(ctrl_sock); ctrl_sock = -1; } control_thread.join(); }
+
     am->stop(); am.reset();
     if (rt) { rt->stop(); rt.reset(); }
     global_audio = nullptr;
