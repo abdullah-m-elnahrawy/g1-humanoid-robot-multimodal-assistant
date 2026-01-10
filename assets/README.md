@@ -1,1 +1,1 @@
-asset folder
+Assets folder
