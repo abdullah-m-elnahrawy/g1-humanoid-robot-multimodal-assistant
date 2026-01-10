@@ -8,7 +8,9 @@
 
 <p align="center" style="font-size: 18px; color: #24292f; line-height: 1.45; margin-top: 10px;">
   🔊 <b>GIF is silent.</b> Click to watch
-  <a href="https://github.com/abdullah-m-elnahrawy/g1-humanoid-robot-multimodal-assistant/issues/1#issue-3800371917"><b>the full demo video</b></a>.
+<a href="https://github.com/abdullah-m-elnahrawy/g1-humanoid-robot-multimodal-assistant/issues/1#issue-3800371917" target="_blank" rel="noopener noreferrer" style="text-decoration: underline;">
+  <b>the full demo video</b>
+</a>
 </p>
 
 
