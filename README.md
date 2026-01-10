@@ -7,7 +7,5 @@
 </p>
 
 <p align="center">
-  <sub><b>Note:</b> The GIF is silent. Watch the full video</sub>
-  <br/>
-  <sub>Click the GIF to watch the full demo video.</sub>
+  <sub><b>Note: The GIF is silent. Watch the full video</b></sub>
 </p>
