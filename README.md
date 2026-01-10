@@ -6,6 +6,7 @@
   </a>
 </p>
 
-<p align="center">
-  <sub><b>The GIF is silent. Click to watch the full video</b></sub>
+<p align="center" style="font-size: 18px; color: #24292f; line-height: 1.45; margin-top: 10px;">
+  🔊 <b>GIF is silent.</b> Click to watch the full demo video.
 </p>
+
